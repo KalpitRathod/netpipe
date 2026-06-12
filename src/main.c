@@ -88,9 +88,16 @@ static void usage(const char *prog)
         "\n"
         "Output:\n"
         "  -o <file>         Output file (format inferred from extension or -fmt)\n"
+        "  -o tap://<dev>    Inject packets into a Linux TAP (Layer 2) virtual interface\n"
+        "  -o tun://<dev>    Inject packets into a Linux TUN (Layer 3) virtual interface\n"
+        "  -o socket://<h:p> Forward raw packets to a remote host over TCP\n"
         "  -fmt <format>     Output format: pcap (default), json, hex, stats, null\n"
         "  -stats <file>     Write periodic statistics to file (use '-' for stdout)\n"
         "  -c <count>        Stop after capturing N packets\n"
+        "\n"
+        "Processing:\n"
+        "  -proc tcp-stream  Enable TCP stream reassembly\n"
+        "  -rate <bps>       Rate-limit output to N bytes per second (token bucket)\n"
         "\n"
         "Logging:\n"
         "  -v                Verbose (DEBUG level)\n"
@@ -107,8 +114,10 @@ static void usage(const char *prog)
         "  sudo %s -i eth0 -f \"udp port 53\" -fmt json -o dns.json\n"
         "       %s -r dump.pcap -proto http -fmt hex\n"
         "  sudo %s -i lo -port 8080 -stats - -o /dev/null\n"
+        "  sudo %s -r cap.pcap -o tap://tap0 -rate 10000\n"
+        "  sudo %s -i wlo1 -c 50 -o socket://192.168.1.10:9999\n"
         "\n",
-        prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog, prog);
 }
 
 /* ------------------------------------------------------------------ */

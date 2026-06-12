@@ -270,6 +270,20 @@ By writing raw binary packet arrays to the `/dev/net/tun` character device descr
 
 `netpipe` natively includes a `tuntap` sink. When you set the output to `tap://tap0`, it asks the kernel to create a transient virtual `tap0` interface and blindly injects every packet from the pipeline directly into the system routing tables.
 
+**The Code Experiment:**
+```bash
+sudo python3 examples/python/14_tuntap_replay.py
+```
+You will watch `tshark` natively capturing injected packets directly off the kernel `tap0` interface, proving the kernel believes the traffic is real. The underlying C call is simply:
+```c
+write(tap_fd, pkt->raw, pkt->caplen);  // kernel receives this as a physical frame
+```
+
+**Real-world use-cases:**
+- VPN tunneling: OpenVPN and WireGuard do exactly this to route encrypted packets into the kernel
+- Network simulation: replay production traffic in a lab at any speed
+- Active MitM tools: intercept, modify, then re-inject traffic
+
 ---
 
 ## Concept 13: Traffic Shaping with Token Bucket Rate Limiting
@@ -280,29 +294,38 @@ To simulate realistic network conditions or throttle attacks, `netpipe` implemen
 Instead of a simple constant delay, this mathematical algorithm accumulates "tokens" based on CPU clock elapsed time. If the bucket has enough tokens for the size of the packet (`wirelen`), it subtracts them and transmits instantly (allowing initial bursting). If it is empty, it accurately pauses the thread in microseconds until enough clock ticks have passed.
 
 **The Code Experiment:**
-The following script replays a captured TLS handshake into a newly created `tap0` kernel interface at a strict rate of 500 bytes per second (`-rate 500`). While `netpipe` trickles the data, a parallel `tshark` process attaches to `tap0` and captures the injected packets live from the kernel!
 ```bash
 sudo python3 examples/python/14_tuntap_replay.py
+```
+The script replays `encrypted_traffic.pcap` at exactly 500 bytes per second. You will see `tshark` capturing packets with timestamps spread seconds apart, not milliseconds—proof that the token bucket is mathematically controlling the injection cadence.
+
+You can also replay at wire speed with no limit:
+```bash
+sudo ./build/bin/netpipe -r encrypted_traffic.pcap -o tap://tap0
 ```
 
 ---
 
 ## Concept 14: Socket Sinks & Remote Agent Forwarding
 
-The final piece of advanced pipeline architecture is remote forwarding. What if you want to capture packets on a cloud server, but analyze them on your local machine using Wireshark?
+The final piece of advanced pipeline architecture is remote forwarding. What if you want to capture packets on a headless cloud server, but analyse them on your local machine using Wireshark's GUI?
 
-A **Socket Sink** connects the output of the pipeline directly to a TCP socket. `netpipe` establishes a connection to `host:port` and streams the raw byte buffers over the internet. 
+A **Socket Sink** connects the output of the pipeline directly to a TCP socket. Critically, `netpipe` doesn't just stream raw bytes—it writes a **valid PCAP binary format**: first a 24-byte PCAP global header (with magic number, version, and link type), then a 16-byte packet record header before each raw frame. This means the receiver can pipe the stream directly into `tshark -r -` or save it as a `.pcap` file that Wireshark can open.
 
 **The Code Experiment:**
-First, start a netcat listener on port 9999 to simulate a remote agent receiving the stream:
 ```bash
-nc -l -p 9999 > forwarded.pcap
+sudo python3 examples/python/15_socket_forward.py wlo1
 ```
-Then, use the `-o socket://` output sink to capture live traffic and forward it over the socket!
+The script spins up a Python "remote agent" server, captures 20 live packets, and forwards them as a PCAP stream. The agent validates the magic bytes to confirm you received a legitimate PCAP file.
+
+**Real-world — stream live into tshark on a remote machine:**
 ```bash
-sudo ./build/bin/netpipe -i wlo1 -c 10 -o socket://127.0.0.1:9999
+# On the remote machine (receiving side):
+nc -l -p 9999 | tshark -r -
+
+# On the capture machine:
+sudo ./build/bin/netpipe -i wlo1 -c 50 -o socket://REMOTE_IP:9999
 ```
-When it finishes, you can open `forwarded.pcap` in Wireshark—it contains the identical traffic!
 
 ---
 

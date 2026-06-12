@@ -507,20 +507,37 @@ static np_err_t tuntap_sink_write(np_sink_t *s, const np_packet_t *pkt)
 {
     tuntap_sink_priv_t *p = s->priv;
     if (p->fd < 0) return NP_ERR_GENERIC;
-    
+
+    const uint8_t *buf = NULL;
+    size_t         buflen = 0;
+
     if (p->is_tun) {
+        /* TUN = Layer 3: try net layer first, else fall back to raw */
         if (pkt->net && pkt->net->data && pkt->net->len > 0) {
-            ssize_t n = write(p->fd, pkt->net->data, pkt->net->len);
-            if (n < 0) return NP_ERR_IO;
+            buf    = pkt->net->data;
+            buflen = pkt->net->len;
+        } else {
+            buf    = pkt->raw;
+            buflen = pkt->caplen;
         }
     } else {
+        /* TAP = Layer 2: try eth layer first (Ethernet), else fall back to
+         * the first layer data (handles SLL-encapsulated PCAPs), else raw. */
         if (pkt->eth && pkt->eth->data && pkt->eth->len > 0) {
-            ssize_t n = write(p->fd, pkt->eth->data, pkt->eth->len);
-            if (n < 0) return NP_ERR_IO;
-        } else if (pkt->nlayers > 0 && pkt->layers[0].proto == NP_PROTO_RAW) {
-            ssize_t n = write(p->fd, pkt->raw, pkt->caplen);
-            if (n < 0) return NP_ERR_IO;
+            buf    = pkt->eth->data;
+            buflen = pkt->eth->len;
+        } else if (pkt->nlayers > 0 && pkt->layers[0].data && pkt->layers[0].len > 0) {
+            buf    = pkt->layers[0].data;
+            buflen = pkt->layers[0].len;
+        } else {
+            buf    = pkt->raw;
+            buflen = pkt->caplen;
         }
+    }
+
+    if (buf && buflen > 0) {
+        ssize_t n = write(p->fd, buf, buflen);
+        if (n < 0) return NP_ERR_IO;
     }
     return NP_OK;
 }
@@ -603,7 +620,6 @@ typedef struct {
 
 static np_err_t socket_sink_open(np_sink_t *s, np_linktype_t lt)
 {
-    (void)lt;
     socket_sink_priv_t *p = s->priv;
     
     struct hostent *he = gethostbyname(p->host);
@@ -632,6 +648,33 @@ static np_err_t socket_sink_open(np_sink_t *s, np_linktype_t lt)
     }
     
     NP_LOG_INFO("socket: connected to %s:%d", p->host, p->port);
+
+    /* Write a PCAP global header so the receiver can parse this as a valid
+     * pcap file/stream directly (e.g. piped into Wireshark or tshark). */
+    struct {
+        uint32_t magic;
+        uint16_t major;
+        uint16_t minor;
+        int32_t  thiszone;
+        uint32_t sigfigs;
+        uint32_t snaplen;
+        uint32_t network;
+    } __attribute__((packed)) ghdr = {
+        .magic   = 0xa1b2c3d4,
+        .major   = 2,
+        .minor   = 4,
+        .thiszone = 0,
+        .sigfigs = 0,
+        .snaplen = 65535,
+        .network = (uint32_t)lt,  /* link type matches the capture source */
+    };
+    if (send(p->fd, &ghdr, sizeof(ghdr), 0) < 0) {
+        NP_LOG_ERROR("%s", "socket: failed to write pcap global header");
+        close(p->fd);
+        p->fd = -1;
+        return NP_ERR_IO;
+    }
+
     return NP_OK;
 }
 
@@ -639,10 +682,27 @@ static np_err_t socket_sink_write(np_sink_t *s, const np_packet_t *pkt)
 {
     socket_sink_priv_t *p = s->priv;
     if (p->fd < 0) return NP_ERR_GENERIC;
-    
+
+    /* Write a PCAP per-packet record header before the raw bytes */
+    struct {
+        uint32_t ts_sec;
+        uint32_t ts_usec;
+        uint32_t caplen;
+        uint32_t origlen;
+    } __attribute__((packed)) phdr = {
+        .ts_sec  = (uint32_t)(pkt->ts.tv_sec),
+        .ts_usec = (uint32_t)(pkt->ts.tv_nsec / 1000),
+        .caplen  = (uint32_t)pkt->caplen,
+        .origlen = (uint32_t)pkt->wirelen,
+    };
+
+    if (send(p->fd, &phdr, sizeof(phdr), MSG_MORE) < 0) {
+        NP_LOG_ERROR("%s", "socket: write failed (packet header)");
+        return NP_ERR_IO;
+    }
     ssize_t n = send(p->fd, pkt->raw, pkt->caplen, 0);
     if (n < 0) {
-        NP_LOG_ERROR("%s", "socket: write failed");
+        NP_LOG_ERROR("%s", "socket: write failed (packet data)");
         return NP_ERR_IO;
     }
     
