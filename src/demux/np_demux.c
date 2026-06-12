@@ -235,6 +235,118 @@ static bool looks_like_dns(const uint8_t *payload, size_t len,
     return false;
 }
 
+static int dns_read_name(const uint8_t *payload, size_t len, size_t offset, char *out, size_t out_max)
+{
+    size_t out_idx = 0;
+    size_t og_offset = offset;
+    bool jumped = false;
+    int jumps = 0;
+    
+    while (offset < len) {
+        uint8_t l = payload[offset];
+        if (l == 0) {
+            if (!jumped) og_offset = offset + 1;
+            break;
+        }
+        if ((l & 0xC0) == 0xC0) {
+            if (offset + 1 >= len) return -1;
+            uint16_t ptr = (uint16_t)(((l & 0x3F) << 8) | payload[offset + 1]);
+            if (!jumped) og_offset = offset + 2;
+            offset = ptr;
+            jumped = true;
+            jumps++;
+            if (jumps > 5) return -1; /* avoid loops */
+            continue;
+        }
+        
+        offset++;
+        if (offset + l > len) return -1;
+        
+        if (out_idx > 0 && out_idx < out_max) out[out_idx++] = '.';
+        
+        for (int i = 0; i < l; i++) {
+            if (out_idx < out_max - 1) {
+                out[out_idx++] = (char)payload[offset + (size_t)i];
+            }
+        }
+        offset += l;
+        if (!jumped) og_offset = offset;
+    }
+    
+    if (out_idx < out_max) out[out_idx] = '\0';
+    return (int)og_offset;
+}
+
+static void decode_dns(np_packet_t *pkt, np_layer_t *layer)
+{
+    np_dns_msg_t *msg = np_packet_scratch_alloc(pkt, sizeof(np_dns_msg_t));
+    if (!msg) return;
+    memset(msg, 0, sizeof(*msg));
+    
+    const uint8_t *p = layer->data;
+    size_t len = layer->len;
+    
+    if (len < sizeof(dns_hdr_t)) return;
+    const dns_hdr_t *d = (const dns_hdr_t *)p;
+    
+    msg->id = ntohs(d->id);
+    uint16_t flags = ntohs(d->flags);
+    msg->is_response = (flags & 0x8000) != 0;
+    msg->rcode = flags & 0x0f;
+    
+    int qdcount = ntohs(d->qdcount);
+    int ancount = ntohs(d->ancount);
+    
+    size_t offset = sizeof(dns_hdr_t);
+    
+    if (qdcount > 0) {
+        int next_off = dns_read_name(p, len, offset, msg->query_name, sizeof(msg->query_name));
+        if (next_off < 0) return;
+        offset = (size_t)next_off;
+        
+        if (offset + 4 > len) return;
+        msg->query_type = (uint16_t)((p[offset] << 8) | p[offset + 1]);
+        offset += 4;
+    }
+    
+    for (int i = 0; i < ancount && msg->num_answers < NP_MAX_DNS_ANSWERS && offset < len; i++) {
+        np_dns_answer_t *ans = &msg->answers[msg->num_answers++];
+        
+        int next_off = dns_read_name(p, len, offset, ans->name, sizeof(ans->name));
+        if (next_off < 0) break;
+        offset = (size_t)next_off;
+        
+        if (offset + 10 > len) break;
+        ans->type = (uint16_t)((p[offset] << 8) | p[offset + 1]);
+        ans->class_ = (uint16_t)((p[offset + 2] << 8) | p[offset + 3]);
+        ans->ttl = (uint32_t)((p[offset + 4] << 24) | (p[offset + 5] << 16) | (p[offset + 6] << 8) | p[offset + 7]);
+        ans->data_len = (uint16_t)((p[offset + 8] << 8) | p[offset + 9]);
+        offset += 10;
+        
+        if (offset + ans->data_len > len) break;
+        
+        if (ans->type == 1 && ans->data_len == 4) {
+            snprintf(ans->rdata_str, sizeof(ans->rdata_str), "%u.%u.%u.%u",
+                     p[offset], p[offset+1], p[offset+2], p[offset+3]);
+        } else if (ans->type == 28 && ans->data_len == 16) {
+            snprintf(ans->rdata_str, sizeof(ans->rdata_str),
+                     "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+                     p[offset], p[offset+1], p[offset+2], p[offset+3],
+                     p[offset+4], p[offset+5], p[offset+6], p[offset+7],
+                     p[offset+8], p[offset+9], p[offset+10], p[offset+11],
+                     p[offset+12], p[offset+13], p[offset+14], p[offset+15]);
+        } else if (ans->type == 5) {
+            dns_read_name(p, len, offset, ans->rdata_str, sizeof(ans->rdata_str));
+        } else {
+            snprintf(ans->rdata_str, sizeof(ans->rdata_str), "<type %d>", ans->type);
+        }
+        
+        offset += ans->data_len;
+    }
+    
+    layer->decoded = msg;
+}
+
 static bool looks_like_http(const uint8_t *payload, size_t len)
 {
     if (len < 8) return false;
@@ -387,6 +499,7 @@ static np_err_t decode_app(np_packet_t *pkt,
         if (l) {
             pkt->app = l;
             if (app_proto == NP_PROTO_HTTP) decode_http(pkt, l);
+            else if (app_proto == NP_PROTO_DNS) decode_dns(pkt, l);
         }
     }
 

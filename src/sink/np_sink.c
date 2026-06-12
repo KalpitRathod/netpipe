@@ -193,6 +193,36 @@ static np_err_t json_sink_write(np_sink_t *s, const np_packet_t *pkt)
             fprint_json_str(p->fp, http->headers[i].value.str, http->headers[i].value.len);
         }
         fprintf(p->fp, "}}");
+    } else if (pkt->app && pkt->app->proto == NP_PROTO_DNS && pkt->app->decoded) {
+        const np_dns_msg_t *dns = pkt->app->decoded;
+        fprintf(p->fp, ",\"dns\":{");
+        fprintf(p->fp, "\"id\":%u,", dns->id);
+        fprintf(p->fp, "\"is_response\":%s,", dns->is_response ? "true" : "false");
+        fprintf(p->fp, "\"rcode\":%d,", dns->rcode);
+        
+        if (dns->query_name[0]) {
+            fprintf(p->fp, "\"query\":{\"name\":");
+            fprint_json_str(p->fp, dns->query_name, strlen(dns->query_name));
+            fprintf(p->fp, ",\"type\":%u},", dns->query_type);
+        } else {
+            fprintf(p->fp, "\"query\":null,");
+        }
+        
+        fprintf(p->fp, "\"answers\":[");
+        for (int i = 0; i < dns->num_answers; i++) {
+            const np_dns_answer_t *ans = &dns->answers[i];
+            if (i > 0) fprintf(p->fp, ",");
+            fprintf(p->fp, "{\"name\":"); fprint_json_str(p->fp, ans->name, strlen(ans->name));
+            fprintf(p->fp, ",\"type\":%u,\"class\":%u,\"ttl\":%u,\"data\":",
+                    ans->type, ans->class_, ans->ttl);
+            if (ans->rdata_str[0]) {
+                fprint_json_str(p->fp, ans->rdata_str, strlen(ans->rdata_str));
+            } else {
+                fprintf(p->fp, "null");
+            }
+            fprintf(p->fp, "}");
+        }
+        fprintf(p->fp, "]}");
     }
 
     fprintf(p->fp, "}\n");

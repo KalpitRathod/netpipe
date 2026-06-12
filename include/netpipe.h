@@ -95,6 +95,30 @@ typedef struct {
     size_t           body_len;
 } np_http_msg_t;
 
+#define NP_MAX_DNS_ANSWERS 8
+
+typedef struct {
+    char     name[256];
+    uint16_t type;
+    uint16_t class_;
+    uint32_t ttl;
+    uint16_t data_len;
+    /* For A/AAAA/CNAME, we can store a string representation here */
+    char     rdata_str[256];
+} np_dns_answer_t;
+
+typedef struct {
+    uint16_t id;
+    bool     is_response;
+    int      rcode;
+    
+    char     query_name[256];
+    uint16_t query_type;
+    
+    int              num_answers;
+    np_dns_answer_t  answers[NP_MAX_DNS_ANSWERS];
+} np_dns_msg_t;
+
 /* ------------------------------------------------------------------ */
 /*  Protocol layer IDs                                                  */
 /* ------------------------------------------------------------------ */
