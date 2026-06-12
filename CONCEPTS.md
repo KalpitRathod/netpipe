@@ -233,55 +233,76 @@ During our extreme HTTPS capture test, the `netpipe` engine did not know how to 
 **The Lesson:**
 Network engines cannot blindly assume a packet starts with an IP header. They must read the interface's Link-Layer Type and apply the correct byte-offsets. We fixed `netpipe` by teaching its core Demuxer (`np_demux.c`) to parse SLL headers before extracting the IP packets.
 
----
+## Concept 11: Application-Layer Decoding & Zero-Copy Extraction (HTTP & DNS)
 
-## Concept 11: Application-Layer Decoding (HTTP & DNS)
+In early concepts, we treated packet payloads as opaque "raw bytes" or strings. However, real-world protocols like HTTP and DNS are structurally complex: HTTP uses unpredictable variable-length strings separated by `\r\n`, and DNS uses advanced pointer-based compression to encode domain names efficiently.
 
-In early concepts, we treated the payload of TCP or UDP packets as opaque "raw bytes" (sometimes viewing them as hex or ascii strings). However, network engines like Wireshark and `netpipe` don't just stop at the transport layer—they parse the application layer (Layer 7) as well.
+Most network tools fail to scale because they allocate and copy memory for every HTTP header or DNS record they parse. 
 
-This is extremely difficult in C because you cannot simply map a `struct` over a text-based protocol like HTTP (which uses unpredictable variable-length strings separated by `\r\n`). 
-
-**How `netpipe` Solves This:**
-Instead of constantly allocating and freeing memory (which destroys performance), `netpipe` uses a **Scratch Buffer**. Each packet has an 8KB scratch space. When the Demuxer detects an HTTP or DNS packet:
-1. It allocates a complex structure (like `np_http_msg_t` or `np_dns_msg_t`) directly inside that 8KB scratch buffer.
-2. It uses "zero-copy strings" (`np_str_t`) which are simply pointers back into the original raw packet array.
-3. It recursively uncompresses DNS name pointers or parses HTTP headers without duplicating any strings in memory.
+**The `netpipe` Zero-Copy Architecture:**
+To achieve near-instantaneous Deep Packet Inspection (DPI), `netpipe` relies on a **Packet Scratch Buffer** and **Zero-Copy Strings (`np_str_t`)**.
+When a packet arrives:
+1. `netpipe` reserves an internal 8KB buffer exclusively for that packet.
+2. The Demuxer builds C structs (`np_http_msg_t`, `np_dns_msg_t`) directly inside this scratch area without calling `malloc()`.
+3. Strings like `google.com` or `User-Agent` are not copied. Instead, `np_str_t` simply stores a pointer directly into the live ethernet frame's memory along with a length.
 
 **The Code Experiment:**
-Run these two scripts to see the C-engine's native decoders perfectly dump HTTP and DNS data directly into JSON format for Python to read:
-
+Run these scripts to see zero-copy DPI natively dump fully structured JSON:
 ```bash
+# Capture raw HTTP traffic and parse methods/headers instantly
 sudo python3 examples/python/12_http_parser_demo.py wlo1
+
+# See how pointer-compressed DNS queries are unrolled and decoded
 sudo python3 examples/python/13_dns_spy.py wlo1
 ```
 
-You'll instantly see how `google.com` is resolved to an IPv4/IPv6 address via DNS, and how HTTP headers are beautifully organized into structured data.
+---
+
+## Concept 12: TUN/TAP Injection (Active MitM and Traffic Forging)
+
+Passive capture is only half of network engineering. **Active injection** allows us to forge packets or replay captures back into a live network environment. 
+
+Linux provides virtual network devices:
+* **TUN** (Layer 3): Reads and writes raw IP packets.
+* **TAP** (Layer 2): Reads and writes raw Ethernet frames.
+
+By writing raw binary packet arrays to the `/dev/net/tun` character device descriptor with the `IFF_TAP` flag enabled, the kernel's network stack processes those bytes exactly as if they arrived from a physical network interface card (NIC). 
+
+`netpipe` natively includes a `tuntap` sink. When you set the output to `tap://tap0`, it asks the kernel to create a transient virtual `tap0` interface and blindly injects every packet from the pipeline directly into the system routing tables.
 
 ---
 
-## Concept 12: TUN/TAP Injection (Active Replay)
+## Concept 13: Traffic Shaping with Token Bucket Rate Limiting
 
-So far, we've only **read** packets from the network (Passive Capture). But what if we want to forge packets or replay a previous capture back into the live network?
+Network processors can modify and delay data. If you replay a 1GB offline PCAP file into a TAP interface, `netpipe` will inject the entire payload in milliseconds. The kernel queue will overflow, and massive packet loss will occur.
 
-Linux provides virtual network devices called **TUN** (Layer 3 - IP) and **TAP** (Layer 2 - Ethernet). When you write raw bytes to `/dev/net/tun`, the kernel treats them exactly as if they arrived on a real physical network card! 
-
-`netpipe` includes a `tuntap` sink. If you output to `tap://tap0`, `netpipe` asks the kernel to create a virtual `tap0` interface and writes every processed packet directly into the kernel's networking stack. This is the foundation of VPNs and active Man-in-the-Middle (MitM) tools.
-
----
-
-## Concept 13: Traffic Shaping & Rate Limiting
-
-Network processors don't just inspect data; they can modify or delay it. 
-If you replay a 1GB PCAP file into a TAP interface, `netpipe` will process it as fast as your CPU allows (often within milliseconds), causing massive network spikes and dropping packets.
-
-To simulate realistic network conditions (or throttle attacks), we use a **Token Bucket Rate Limiter**. This algorithm mathematically delays packets so that the output byte rate exactly matches a defined limit (e.g., `-rate 10000` for 10KB/s). 
+To simulate realistic network conditions or throttle attacks, `netpipe` implements a **Token Bucket Rate Limiter**. 
+Instead of a simple constant delay, this mathematical algorithm accumulates "tokens" based on CPU clock elapsed time. If the bucket has enough tokens for the size of the packet (`wirelen`), it subtracts them and transmits instantly (allowing initial bursting). If it is empty, it accurately pauses the thread in microseconds until enough clock ticks have passed.
 
 **The Code Experiment:**
-Run this script to see `netpipe` read an old PCAP file, rate-limit the packets, and inject them into a virtual `tap0` interface while `tshark` listens to the kernel proving the packets are real!
-
+The following script replays a captured TLS handshake into a newly created `tap0` kernel interface at a strict rate of 500 bytes per second (`-rate 500`). While `netpipe` trickles the data, a parallel `tshark` process attaches to `tap0` and captures the injected packets live from the kernel!
 ```bash
 sudo python3 examples/python/14_tuntap_replay.py
 ```
+
+---
+
+## Concept 14: Socket Sinks & Remote Agent Forwarding
+
+The final piece of advanced pipeline architecture is remote forwarding. What if you want to capture packets on a cloud server, but analyze them on your local machine using Wireshark?
+
+A **Socket Sink** connects the output of the pipeline directly to a TCP socket. `netpipe` establishes a connection to `host:port` and streams the raw byte buffers over the internet. 
+
+**The Code Experiment:**
+First, start a netcat listener on port 9999 to simulate a remote agent receiving the stream:
+```bash
+nc -l -p 9999 > forwarded.pcap
+```
+Then, use the `-o socket://` output sink to capture live traffic and forward it over the socket!
+```bash
+sudo ./build/bin/netpipe -i wlo1 -c 10 -o socket://127.0.0.1:9999
+```
+When it finishes, you can open `forwarded.pcap` in Wireshark—it contains the identical traffic!
 
 ---
 

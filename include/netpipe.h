@@ -253,6 +253,7 @@ np_sink_t *np_sink_hex(const char *path);          /* human hex dump         */
 np_sink_t *np_sink_stats(const char *path);        /* periodic statistics    */
 np_sink_t *np_sink_null(void);                     /* /dev/null sink         */
 np_sink_t *np_sink_tuntap(const char *uri);        /* TUN/TAP inject sink    */
+np_sink_t *np_sink_socket(const char *uri);        /* Remote socket sink     */
 void       np_sink_free(np_sink_t *s);
 np_err_t   np_pipeline_add_sink(np_pipeline_t *pl, np_sink_t *s);
 

@@ -581,10 +581,127 @@ np_sink_t *np_sink_tuntap(const char *uri)
 #else
 np_sink_t *np_sink_tuntap(const char *uri) {
     (void)uri;
-    NP_LOG_ERROR("tuntap sink is only supported on Linux");
+    NP_LOG_ERROR("%s", "tuntap sink is only supported on Linux");
     return NULL;
 }
 #endif
+
+/* ------------------------------------------------------------------ */
+/*  Socket sink                                                         */
+/* ------------------------------------------------------------------ */
+
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+
+typedef struct {
+    int fd;
+    char host[128];
+    int port;
+} socket_sink_priv_t;
+
+static np_err_t socket_sink_open(np_sink_t *s, np_linktype_t lt)
+{
+    (void)lt;
+    socket_sink_priv_t *p = s->priv;
+    
+    struct hostent *he = gethostbyname(p->host);
+    if (!he) {
+        NP_LOG_ERROR("socket: unknown host %s", p->host);
+        return NP_ERR_GENERIC;
+    }
+    
+    p->fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (p->fd < 0) {
+        NP_LOG_ERROR("%s", "socket: creation failed");
+        return NP_ERR_GENERIC;
+    }
+    
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)p->port);
+    memcpy(&addr.sin_addr, he->h_addr_list[0], (size_t)he->h_length);
+    
+    if (connect(p->fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        NP_LOG_ERROR("socket: failed to connect to %s:%d", p->host, p->port);
+        close(p->fd);
+        p->fd = -1;
+        return NP_ERR_GENERIC;
+    }
+    
+    NP_LOG_INFO("socket: connected to %s:%d", p->host, p->port);
+    return NP_OK;
+}
+
+static np_err_t socket_sink_write(np_sink_t *s, const np_packet_t *pkt)
+{
+    socket_sink_priv_t *p = s->priv;
+    if (p->fd < 0) return NP_ERR_GENERIC;
+    
+    ssize_t n = send(p->fd, pkt->raw, pkt->caplen, 0);
+    if (n < 0) {
+        NP_LOG_ERROR("%s", "socket: write failed");
+        return NP_ERR_IO;
+    }
+    
+    return NP_OK;
+}
+
+static void socket_sink_close(np_sink_t *s)
+{
+    socket_sink_priv_t *p = s->priv;
+    if (p->fd >= 0) {
+        close(p->fd);
+        p->fd = -1;
+    }
+}
+
+static void socket_sink_free(np_sink_t *s)
+{
+    socket_sink_close(s);
+    free(s->priv);
+    free(s);
+}
+
+static const struct np_sink_ops socket_sink_ops = {
+    .open  = socket_sink_open,
+    .write = socket_sink_write,
+    .close = socket_sink_close,
+    .free  = socket_sink_free,
+};
+
+np_sink_t *np_sink_socket(const char *uri)
+{
+    if (strncmp(uri, "socket://", 9) != 0) return NULL;
+    
+    char host_port[256];
+    strncpy(host_port, uri + 9, sizeof(host_port) - 1);
+    host_port[sizeof(host_port) - 1] = '\0';
+    
+    char *colon = strchr(host_port, ':');
+    if (!colon) {
+        NP_LOG_ERROR("socket: invalid uri '%s' (expected socket://host:port)", uri);
+        return NULL;
+    }
+    *colon = '\0';
+    
+    socket_sink_priv_t *p = calloc(1, sizeof(*p));
+    if (!p) return NULL;
+    
+    p->fd = -1;
+    snprintf(p->host, sizeof(p->host), "%s", host_port);
+    p->port = atoi(colon + 1);
+    
+    np_sink_t *s = calloc(1, sizeof(*s));
+    if (!s) { free(p); return NULL; }
+    
+    s->ops  = &socket_sink_ops;
+    s->priv = p;
+    snprintf(s->name, sizeof(s->name), "socket:%s:%d", p->host, p->port);
+    return s;
+}
 
 void np_sink_free(np_sink_t *s)
 {
