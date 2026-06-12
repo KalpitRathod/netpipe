@@ -114,6 +114,10 @@ typedef struct np_packet {
     /* stats / metadata */
     uint64_t         seq;        /* global capture sequence number */
     uint32_t         flow_id;    /* flow hash */
+
+    /* stream reassembly payload (dynamically allocated, freed automatically) */
+    uint8_t         *stream_data;
+    size_t           stream_len;
 } np_packet_t;
 
 np_packet_t *np_packet_alloc(size_t caplen);
@@ -172,6 +176,7 @@ typedef struct np_processor np_processor_t;
 /* callback-based processor */
 typedef np_err_t (*np_proc_fn)(np_packet_t *pkt, void *userdata);
 np_processor_t *np_processor_fn(np_proc_fn fn, void *userdata);
+np_processor_t *np_processor_tcp_stream(void);
 np_err_t        np_pipeline_add_processor(np_pipeline_t *pl, np_processor_t *proc);
 
 /* ------------------------------------------------------------------ */

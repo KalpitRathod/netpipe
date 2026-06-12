@@ -32,6 +32,7 @@ void np_packet_free(np_packet_t *pkt)
 {
     if (!pkt) return;
     free(pkt->raw);
+    if (pkt->stream_data) free(pkt->stream_data);
     free(pkt);
 }
 

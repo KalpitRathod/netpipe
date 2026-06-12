@@ -149,7 +149,17 @@ static np_err_t json_sink_write(np_sink_t *s, const np_packet_t *pkt)
     size_t dump = pkt->caplen < 1500 ? pkt->caplen : 1500;
     fprintf(p->fp, "],\"raw_hex\":\"");
     for (size_t i = 0; i < dump; i++) fprintf(p->fp, "%02x", pkt->raw[i]);
-    fprintf(p->fp, "\"}\n");
+    fprintf(p->fp, "\"");
+
+    if (pkt->stream_data && pkt->stream_len > 0) {
+        fprintf(p->fp, ",\"stream_hex\":\"");
+        for (size_t i = 0; i < pkt->stream_len; i++) {
+            fprintf(p->fp, "%02x", pkt->stream_data[i]);
+        }
+        fprintf(p->fp, "\"");
+    }
+
+    fprintf(p->fp, "}\n");
 
     p->count++;
     if (p->count % 1000 == 0) fflush(p->fp);

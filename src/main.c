@@ -227,6 +227,7 @@ int main(int argc, char *argv[])
     bool        list_dev   = false;
     bool        no_color   = false;
     uint16_t    port_num   = 0;
+    bool        use_tcp_stream = false;
 
     /* ---- Arg parsing ---- */
     for (int i = 1; i < argc; i++) {
@@ -260,6 +261,11 @@ int main(int argc, char *argv[])
         else if (!strcmp(a, "-T"))     { NEED_ARG("-T");     timeout_ms = atoi(argv[++i]); }
         else if (!strcmp(a, "-c"))     { NEED_ARG("-c");     count      = (uint64_t)strtoull(argv[++i], NULL, 10); }
         else if (!strcmp(a, "-port"))  { NEED_ARG("-port");  port_num   = (uint16_t)atoi(argv[++i]); }
+        else if (!strcmp(a, "-proc"))  { 
+            NEED_ARG("-proc");
+            if (!strcmp(argv[++i], "tcp-stream")) use_tcp_stream = true;
+            else { fprintf(stderr, "unknown processor: %s\n", argv[i]); return 1; }
+        }
         else {
             fprintf(stderr, "unknown option: %s  (use -h for help)\n", a);
             return 1;
@@ -328,6 +334,11 @@ int main(int argc, char *argv[])
     if (count > 0) {
         np_processor_t *cp = np_processor_fn(count_proc, &count_state);
         if (cp) np_pipeline_add_processor(pl, cp);
+    }
+    if (use_tcp_stream) {
+        np_processor_t *sp = np_processor_tcp_stream();
+        if (sp) np_pipeline_add_processor(pl, sp);
+        else { NP_LOG_ERROR("%s", "failed to create tcp stream processor"); return 1; }
     }
 
     /* Sinks */

@@ -47,7 +47,8 @@ SRCS := \
 	$(SRCDIR)/source/np_source_pcap.c \
 	$(SRCDIR)/filter/np_filter.c \
 	$(SRCDIR)/sink/np_sink.c \
-	$(SRCDIR)/processor/np_processor.c
+	$(SRCDIR)/processor/np_processor.c \
+	$(SRCDIR)/processor/np_tcp_stream.c
 
 # Library sources (everything except main.c)
 LIB_SRCS := $(filter-out $(SRCDIR)/main.c, $(SRCS))
