@@ -93,16 +93,6 @@ np_err_t np_pipeline_run(np_pipeline_t *pl)
         NP_LOG_WARN("%s", "no sinks configured — packets will be discarded");
     }
 
-    /* Open all sinks */
-    np_linktype_t lt = pl->nsources > 0 ? pl->sources[0]->linktype : NP_LINK_ETHERNET;
-    for (int i = 0; i < pl->nsinks; i++) {
-        np_err_t e = pl->sinks[i]->ops->open(pl->sinks[i], lt);
-        if (e != NP_OK) {
-            NP_LOG_ERROR("failed to open sink '%s'", pl->sinks[i]->name);
-            return e;
-        }
-    }
-
     /* Open all sources */
     for (int i = 0; i < pl->nsources; i++) {
         np_err_t e = pl->sources[i]->ops->open(pl->sources[i]);
@@ -112,6 +102,16 @@ np_err_t np_pipeline_run(np_pipeline_t *pl)
         }
         NP_LOG_INFO("source '%s' opened (linktype=%d)",
                     pl->sources[i]->name, pl->sources[i]->linktype);
+    }
+
+    /* Open all sinks now that linktypes are known */
+    np_linktype_t lt = pl->nsources > 0 ? pl->sources[0]->linktype : NP_LINK_ETHERNET;
+    for (int i = 0; i < pl->nsinks; i++) {
+        np_err_t e = pl->sinks[i]->ops->open(pl->sinks[i], lt);
+        if (e != NP_OK) {
+            NP_LOG_ERROR("failed to open sink '%s'", pl->sinks[i]->name);
+            return e;
+        }
     }
 
     pl->running = true;
