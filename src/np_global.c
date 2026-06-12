@@ -12,13 +12,13 @@ np_err_t np_init(void)
 {
     np_log_set_color(true);
     np_log_set_level(NP_LOG_INFO);
-    NP_LOG_DEBUG("netpipe %s initialised", NETPIPE_VERSION_STR);
+    NP_LOG_DEBUG("%s", "netpipe " NETPIPE_VERSION_STR " initialised");
     return NP_OK;
 }
 
 void np_cleanup(void)
 {
-    NP_LOG_DEBUG("netpipe cleanup");
+    NP_LOG_DEBUG("%s", "netpipe cleanup");
 }
 
 const char *np_strerror(np_err_t err)

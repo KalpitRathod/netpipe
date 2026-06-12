@@ -59,7 +59,7 @@ static np_err_t pcap_sink_open(np_sink_t *s, np_linktype_t lt)
     }
 
     p->fake = pcap_open_dead(dlt, 65535);
-    if (!p->fake) { NP_LOG_ERROR("pcap_open_dead failed"); return NP_ERR_IO; }
+    if (!p->fake) { NP_LOG_ERROR("%s", "pcap_open_dead failed"); return NP_ERR_IO; }
 
     p->dumper = pcap_dump_open(p->fake, p->path);
     if (!p->dumper) {

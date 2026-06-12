@@ -27,10 +27,12 @@
 #include <stdint.h>
 #include <ctype.h>
 #include <pcap/pcap.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 
 #include "netpipe.h"
-#include "src/log/np_log.h"
-#include "src/pipeline/np_pipeline.h"
+#include "log/np_log.h"
+#include "pipeline/np_pipeline.h"
 
 /* ------------------------------------------------------------------ */
 /*  Global pipeline (for signal handling)                               */
@@ -203,8 +205,6 @@ static const char *infer_fmt(const char *path)
 /*  Main                                                                */
 /* ------------------------------------------------------------------ */
 
-#include <arpa/inet.h>   /* inet_aton */
-#include <netinet/in.h>
 
 int main(int argc, char *argv[])
 {
@@ -280,7 +280,7 @@ int main(int argc, char *argv[])
 
     /* ---- Build pipeline ---- */
     np_pipeline_t *pl = np_pipeline_new();
-    if (!pl) { NP_LOG_FATAL("out of memory"); return 1; }
+    if (!pl) { NP_LOG_FATAL("%s", "out of memory"); return 1; }
     g_pipeline = pl;
 
     /* Source */
@@ -336,7 +336,7 @@ int main(int argc, char *argv[])
         else if (!strcmp(eff_fmt, "null"))  out_sink = np_sink_null();
         else                                out_sink = np_sink_pcap(outfile);
 
-        if (!out_sink) { NP_LOG_ERROR("failed to create output sink"); return 1; }
+        if (!out_sink) { NP_LOG_ERROR("%s", "failed to create output sink"); return 1; }
         np_pipeline_add_sink(pl, out_sink);
     } else if (fmt) {
         /* No -o but -fmt given → use stdout/- */

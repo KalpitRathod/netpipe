@@ -52,8 +52,11 @@ np_filter_t *np_filter_bpf(const char *expr)
     bpf_priv_t *p = calloc(1, sizeof(*p));
     if (!p) return NULL;
 
-    /* compile without a specific device (snapshot=65535, link=EN10MB) */
-    if (pcap_compile_nopcap(65535, DLT_EN10MB, &p->prog, expr, 1, PCAP_NETMASK_UNKNOWN) != 0) {
+    pcap_t *dead = pcap_open_dead(DLT_EN10MB, 65535);
+    if (!dead) { free(p); return NULL; }
+    int rc = pcap_compile(dead, &p->prog, expr, 1, PCAP_NETMASK_UNKNOWN);
+    pcap_close(dead);
+    if (rc != 0) {
         NP_LOG_ERROR("BPF compile failed: '%s'", expr);
         free(p);
         return NULL;

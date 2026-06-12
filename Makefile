@@ -61,6 +61,7 @@ CFLAGS_BASE := \
 	-Wall -Wextra -Wpedantic \
 	-Wformat=2 -Wformat-security \
 	-Wshadow -Wconversion \
+	-Wno-format-truncation \
 	-I$(INCDIR) \
 	-D_GNU_SOURCE \
 	-D_POSIX_C_SOURCE=200809L

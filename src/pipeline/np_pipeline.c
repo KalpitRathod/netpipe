@@ -85,11 +85,11 @@ void np_pipeline_stop(np_pipeline_t *pl)
 np_err_t np_pipeline_run(np_pipeline_t *pl)
 {
     if (pl->nsources == 0) {
-        NP_LOG_ERROR("no sources configured");
+        NP_LOG_ERROR("%s", "no sources configured");
         return NP_ERR_GENERIC;
     }
     if (pl->nsinks == 0) {
-        NP_LOG_WARN("no sinks configured — packets will be discarded");
+        NP_LOG_WARN("%s", "no sinks configured — packets will be discarded");
     }
 
     /* Open all sinks */
@@ -119,7 +119,7 @@ np_err_t np_pipeline_run(np_pipeline_t *pl)
 
     /* Round-robin across sources until all are exhausted */
     int active = pl->nsources;
-    bool *exhausted = calloc(pl->nsources, sizeof(bool));
+    bool *exhausted = calloc((size_t)pl->nsources, sizeof(bool));
     if (!exhausted) return NP_ERR_NOMEM;
 
     while (pl->running && active > 0) {
