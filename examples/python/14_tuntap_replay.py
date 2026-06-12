@@ -7,7 +7,7 @@ TAP Injection & Packet Replay Demo
 This script demonstrates the native TUN/TAP inject sink.  It replays
 an existing PCAP file back into the Linux kernel through a virtual TAP
 interface, rate-limited to 500 B/s so you can watch it in real time
-with tshark.
+with a second netpipe capture process.
 
 What actually happens:
   1.  netpipe reads encrypted_traffic.pcap (captured during 10_tls_capture.py)
@@ -15,7 +15,7 @@ What actually happens:
   3.  netpipe opens /dev/net/tun, asks the kernel to create tap0 with IFF_TAP
   4.  For every packet, it writes the raw Ethernet frame into the tap0 fd
   5.  The kernel treats those bytes identically to a physical NIC receiving them
-  6.  tshark attaches to tap0 and proves the kernel sees real packets
+  6.  A second netpipe process attaches to tap0 and proves the kernel sees real packets
 
 Prerequisites:
   sudo python3 examples/python/10_tls_capture.py wlo1   # generate the pcap
@@ -33,8 +33,8 @@ import pathlib as _pl
 _HERE = _pl.Path(__file__).resolve().parent
 NETPIPE = str(_HERE / "../../build/bin/netpipe")
 
-RATE_BPS  = 500       # bytes per second — slow enough for tshark to attach
-TSHARK_N  = 8         # how many packets tshark should capture
+RATE_BPS  = 500       # bytes per second — slow enough to attach
+CAPTURE_N = 8         # how many packets to capture off the kernel interface
 
 # ─── colours ─────────────────────────────────────────────────────────────────
 R = "\033[0m";  B = "\033[1m";  CY = "\033[36m";  YL = "\033[33m"
@@ -57,10 +57,20 @@ def main() -> None:
         print(f"  Run first:  sudo python3 {_HERE}/10_tls_capture.py <iface>")
         sys.exit(1)
 
-    pkt_count = int(subprocess.check_output(
-        ["tshark", "-r", str(pcap_path), "-T", "fields", "-e", "frame.number"],
-        stderr=subprocess.DEVNULL
-    ).decode().strip().split("\n")[-1] or "0")
+    # Count packets using pure Python PCAP parsing (no tshark dependency)
+    pkt_count = 0
+    with open(pcap_path, "rb") as f:
+        global_hdr = f.read(24)
+        if len(global_hdr) == 24:
+            import struct
+            magic = struct.unpack("<I", global_hdr[:4])[0]
+            endian = ">" if magic == 0xd4c3b2a1 else "<"
+            while True:
+                pkt_hdr = f.read(16)
+                if len(pkt_hdr) < 16: break
+                caplen = struct.unpack(f"{endian}I", pkt_hdr[8:12])[0]
+                f.seek(caplen, 1)
+                pkt_count += 1
 
     print(f"\n{B}┌─  TAP Packet Replay Demo  ─────────────────────────────────────┐{R}")
     print(f"{B}│{R}  Source PCAP  : {CY}{pcap_path.name}{R}  ({pkt_count} packets)")
@@ -91,26 +101,16 @@ def main() -> None:
     subprocess.run(["ip", "link", "set", "tap0", "up"], check=True)
     print(f"[{GR}kernel{R}] tap0 is UP — kernel is now receiving injected packets\n")
 
-    # ── 3. tshark reads from the kernel tap0 interface in real time ───────────
-    print(f"[{CY}tshark{R}] capturing {TSHARK_N} packets on tap0:\n")
+    # ── 3. A second netpipe reads from the kernel tap0 interface in real time ─
+    print(f"[{CY}capture{R}] snffing {CAPTURE_N} packets directly off tap0:\n")
     print("─" * 70)
     try:
         subprocess.run(
-            ["tshark", "-i", "tap0", "-c", str(TSHARK_N), "-n",
-             "-T", "fields",
-             "-e", "frame.time_relative",
-             "-e", "ip.src", "-e", "ipv6.src",
-             "-e", "ip.dst", "-e", "ipv6.dst",
-             "-e", "_ws.col.Protocol",
-             "-e", "frame.len",
-             "-E", "separator=\t"],
+            [NETPIPE, "-i", "tap0", "-c", str(CAPTURE_N), "-fmt", "pretty", "-q"],
             check=True,
         )
     except subprocess.CalledProcessError:
         pass
-    except FileNotFoundError:
-        print(f"{RD}tshark not found{R} — but netpipe is still injecting packets into tap0.\n"
-              "  Install wireshark-common for tshark: sudo apt install wireshark-common")
     print("─" * 70)
 
     netpipe_proc.send_signal(signal.SIGINT)

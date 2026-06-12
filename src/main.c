@@ -91,7 +91,7 @@ static void usage(const char *prog)
         "  -o tap://<dev>    Inject packets into a Linux TAP (Layer 2) virtual interface\n"
         "  -o tun://<dev>    Inject packets into a Linux TUN (Layer 3) virtual interface\n"
         "  -o socket://<h:p> Forward raw packets to a remote host over TCP\n"
-        "  -fmt <format>     Output format: pcap (default), json, hex, stats, null\n"
+        "  -fmt <format>     Output format: pcap (default), json, hex, pretty, stats, null\n"
         "  -stats <file>     Write periodic statistics to file (use '-' for stdout)\n"
         "  -c <count>        Stop after capturing N packets\n"
         "\n"
@@ -369,6 +369,7 @@ int main(int argc, char *argv[])
             const char *eff_fmt = fmt ? fmt : infer_fmt(outfile);
             if (!strcmp(eff_fmt, "json"))       out_sink = np_sink_json(outfile);
             else if (!strcmp(eff_fmt, "hex"))   out_sink = np_sink_hex(outfile);
+            else if (!strcmp(eff_fmt, "pretty")) out_sink = np_sink_pretty(outfile);
             else if (!strcmp(eff_fmt, "stats")) out_sink = np_sink_stats(outfile);
             else if (!strcmp(eff_fmt, "null"))  out_sink = np_sink_null();
             else                                out_sink = np_sink_pcap(outfile);
@@ -381,16 +382,17 @@ int main(int argc, char *argv[])
         np_sink_t *out_sink = NULL;
         if (!strcmp(fmt, "json"))   out_sink = np_sink_json("-");
         else if (!strcmp(fmt, "hex"))    out_sink = np_sink_hex("-");
+        else if (!strcmp(fmt, "pretty")) out_sink = np_sink_pretty("-");
         else if (!strcmp(fmt, "stats"))  out_sink = np_sink_stats("-");
         else if (!strcmp(fmt, "null"))   out_sink = np_sink_null();
         else {
-            NP_LOG_WARN("format '%s' requires an output file (-o). Defaulting to hex dump.", fmt);
-            out_sink = np_sink_hex("-");
+            NP_LOG_WARN("format '%s' requires an output file (-o). Defaulting to pretty.", fmt);
+            out_sink = np_sink_pretty("-");
         }
         if (out_sink) np_pipeline_add_sink(pl, out_sink);
     } else {
-        /* Default: hex dump to stdout */
-        np_pipeline_add_sink(pl, np_sink_hex("-"));
+        /* Default: pretty to stdout */
+        np_pipeline_add_sink(pl, np_sink_pretty("-"));
     }
 
     /* Optional stats side-channel */

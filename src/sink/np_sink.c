@@ -457,6 +457,241 @@ np_sink_t *np_sink_null(void)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Pretty (tshark-style) sink                                          */
+/* ------------------------------------------------------------------ */
+
+/* ANSI colours — only emit when writing to a real terminal */
+#include <unistd.h>
+#define COL(s)  (use_color ? (s) : "")
+#define CRESET  "\033[0m"
+#define CGRAY   "\033[90m"
+#define CCYAN   "\033[36m"
+#define CGREEN  "\033[32m"
+#define CYELLOW "\033[33m"
+#define CRED    "\033[31m"
+#define CBLUE   "\033[34m"
+#define CMAG    "\033[35m"
+#define CBOLD   "\033[1m"
+
+typedef struct { FILE *fp; bool use_color; } pretty_sink_priv_t;
+
+/* Format an IPv4 address from 4 bytes in network order */
+static void fmt_ip4(char *buf, size_t bsz, const uint8_t *b) {
+    snprintf(buf, bsz, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+}
+/* Format an IPv6 address from 16 bytes */
+static void fmt_ip6(char *buf, size_t bsz, const uint8_t *b) {
+    snprintf(buf, bsz, "%x:%x:%x:%x:%x:%x:%x:%x",
+        (unsigned)((b[0]<<8)|b[1]), (unsigned)((b[2]<<8)|b[3]),
+        (unsigned)((b[4]<<8)|b[5]), (unsigned)((b[6]<<8)|b[7]),
+        (unsigned)((b[8]<<8)|b[9]), (unsigned)((b[10]<<8)|b[11]),
+        (unsigned)((b[12]<<8)|b[13]), (unsigned)((b[14]<<8)|b[15]));
+}
+
+/* Build the "Info" column from decoded app-layer data */
+static void build_info(const np_packet_t *pkt, char *info, size_t isz)
+{
+    info[0] = '\0';
+    if (!pkt->app || !pkt->app->decoded) return;
+
+    if (pkt->app->proto == NP_PROTO_HTTP) {
+        const np_http_msg_t *h = pkt->app->decoded;
+        if (h->is_request) {
+            char method[16] = {0}, path[128] = {0};
+            size_t ml = h->method.len < 15 ? h->method.len : 15;
+            size_t pl = h->path.len   < 127 ? h->path.len  : 127;
+            memcpy(method, h->method.str, ml);
+            memcpy(path,   h->path.str,   pl);
+            snprintf(info, isz, "%s %s", method, path);
+        } else {
+            char phrase[32] = {0};
+            size_t phl = h->status_phrase.len < 31 ? h->status_phrase.len : 31;
+            memcpy(phrase, h->status_phrase.str, phl);
+            snprintf(info, isz, "%d %s", h->status_code, phrase);
+        }
+    } else if (pkt->app->proto == NP_PROTO_DNS) {
+        const np_dns_msg_t *d = pkt->app->decoded;
+        if (!d->is_response && d->query_name[0]) {
+            const char *qtype = (d->query_type == 1)  ? "A" :
+                                (d->query_type == 28) ? "AAAA" :
+                                (d->query_type == 5)  ? "CNAME" : "?";
+            snprintf(info, isz, "Q %s %s", qtype, d->query_name);
+        } else if (d->is_response && d->num_answers > 0) {
+            snprintf(info, isz, "A %s → %s",
+                d->query_name[0] ? d->query_name : "?",
+                d->answers[0].rdata_str[0] ? d->answers[0].rdata_str : "?");
+        }
+    } else if (pkt->app->proto == NP_PROTO_TLS) {
+        /* Peek into raw TLS for SNI: ContentType=0x16, HandshakeType=0x01 */
+        const uint8_t *d = pkt->app->data;
+        size_t         n = pkt->app->len;
+        if (n > 9 && d[0] == 0x16 && d[5] == 0x01) {
+            /* ClientHello — scan for SNI extension (type 0x0000) */
+            size_t pos = 9 + 32; /* skip record+handshake header + random */
+            if (pos < n) {
+                pos += 1 + d[pos]; /* skip session id */
+                if (pos + 2 < n) {
+                    uint16_t clen = (uint16_t)((d[pos]<<8)|d[pos+1]); pos += 2 + clen;
+                }
+                if (pos + 1 < n) { pos += 1 + d[pos]; } /* skip compression */
+                if (pos + 2 < n) {
+                    pos += 2; /* extensions length */
+                    while (pos + 4 < n) {
+                        uint16_t etype = (uint16_t)((d[pos]<<8)|d[pos+1]);
+                        uint16_t elen  = (uint16_t)((d[pos+2]<<8)|d[pos+3]);
+                        pos += 4;
+                        if (etype == 0 && pos + 5 < n) {
+                            /* SNI extension: list_len(2)+type(1)+name_len(2)+name */
+                            size_t nlen = (size_t)((d[pos+3]<<8)|d[pos+4]);
+                            if (pos + 5 + nlen <= n && nlen < 200) {
+                                char sni[201] = {0};
+                                memcpy(sni, d + pos + 5, nlen);
+                                snprintf(info, isz, "ClientHello SNI=%s", sni);
+                            }
+                            break;
+                        }
+                        pos += elen;
+                    }
+                }
+            }
+            if (!info[0]) snprintf(info, isz, "ClientHello");
+        } else if (n > 5 && d[0] == 0x16 && d[5] == 0x02) {
+            snprintf(info, isz, "ServerHello");
+        } else if (n > 5 && d[0] == 0x17) {
+            snprintf(info, isz, "ApplicationData (%zu B)", n);
+        }
+    }
+}
+
+static np_err_t pretty_sink_write(np_sink_t *s, const np_packet_t *pkt)
+{
+    pretty_sink_priv_t *p = s->priv;
+    bool use_color = p->use_color;
+
+    /* ── Timestamp ─────────────────────────────────────────────────── */
+    char ts[24];
+    np_packet_ts_str(pkt, ts, sizeof(ts));
+    /* Keep only HH:MM:SS.uuuuuu from the full string */
+    const char *ts_short = strchr(ts, ' ');
+    ts_short = ts_short ? ts_short + 1 : ts;
+
+    /* ── Addresses ─────────────────────────────────────────────────── */
+    char src[48] = "?", dst[48] = "?";
+    uint16_t sport = 0, dport = 0;
+
+    if (pkt->net) {
+        const uint8_t *d = pkt->net->data;
+        if (pkt->net->proto == NP_PROTO_IP4 && pkt->net->len >= 20) {
+            fmt_ip4(src, sizeof(src), d + 12);
+            fmt_ip4(dst, sizeof(dst), d + 16);
+        } else if (pkt->net->proto == NP_PROTO_IP6 && pkt->net->len >= 40) {
+            fmt_ip6(src, sizeof(src), d + 8);
+            fmt_ip6(dst, sizeof(dst), d + 24);
+        }
+    }
+    if (pkt->transport && pkt->transport->len >= 4) {
+        const uint8_t *d = pkt->transport->data;
+        sport = (uint16_t)((d[0] << 8) | d[1]);
+        dport = (uint16_t)((d[2] << 8) | d[3]);
+    }
+
+    /* ── Highest protocol & colour ──────────────────────────────────── */
+    const char *proto_color = CGRAY;
+    const char *proto_name  = "ETH";
+    if (pkt->app) {
+        proto_name = pname(pkt->app->proto);
+        switch (pkt->app->proto) {
+        case NP_PROTO_HTTP: proto_color = CGREEN;  break;
+        case NP_PROTO_DNS:  proto_color = CCYAN;   break;
+        case NP_PROTO_TLS:  proto_color = CMAG;    break;
+        default:            proto_color = CYELLOW; break;
+        }
+    } else if (pkt->transport) {
+        proto_name = pname(pkt->transport->proto);
+        proto_color = (pkt->transport->proto == NP_PROTO_TCP) ? CBLUE : CYELLOW;
+    } else if (pkt->net) {
+        proto_name = pname(pkt->net->proto);
+    }
+
+    /* ── Info string ────────────────────────────────────────────────── */
+    char info[256] = {0};
+    build_info(pkt, info, sizeof(info));
+
+    /* ── Emit one line ──────────────────────────────────────────────── */
+    if (sport || dport) {
+        fprintf(p->fp, "%s%s%s  %-20s%s → %s%-20s%s  %s%-6s%s  %5u  %s%s%s\n",
+            COL(CGRAY),  ts_short, COL(CRESET),
+            src,         COL(CGRAY), COL(CRESET),
+            dst,         COL(CRESET),
+            COL(proto_color), proto_name, COL(CRESET),
+            pkt->wirelen,
+            COL(CGRAY), info, COL(CRESET));
+    } else {
+        fprintf(p->fp, "%s%s%s  %-42s  %s%-6s%s  %5u  %s%s%s\n",
+            COL(CGRAY), ts_short, COL(CRESET),
+            src,
+            COL(proto_color), proto_name, COL(CRESET),
+            pkt->wirelen,
+            COL(CGRAY), info, COL(CRESET));
+    }
+    fflush(p->fp);
+    return NP_OK;
+}
+
+static np_err_t pretty_sink_open(np_sink_t *s, np_linktype_t lt)
+{
+    (void)lt;
+    pretty_sink_priv_t *p = s->priv;
+    bool to_stdout = (p->fp == stdout);
+
+    /* Print a header row */
+    bool use_color = p->use_color;
+    fprintf(p->fp, "%s%-12s  %-20s  %-20s  %-6s  %5s  %s%s\n",
+        COL(CBOLD),
+        "Time", "Source", "Destination", "Proto", "Len", "Info",
+        COL(CRESET));
+    fprintf(p->fp, "%s%s%s\n", COL(CGRAY),
+        "─────────────────────────────────────────────────────────────────────────────",
+        COL(CRESET));
+    (void)to_stdout;
+    return NP_OK;
+}
+
+static void pretty_sink_close(np_sink_t *s)
+{
+    pretty_sink_priv_t *p = s->priv;
+    if (p->fp && p->fp != stdout) fclose(p->fp);
+}
+static void pretty_sink_free(np_sink_t *s)
+{
+    pretty_sink_close(s);
+    free(s->priv);
+    free(s);
+}
+static const struct np_sink_ops pretty_sink_ops = {
+    .open  = pretty_sink_open,
+    .write = pretty_sink_write,
+    .close = pretty_sink_close,
+    .free  = pretty_sink_free,
+};
+
+np_sink_t *np_sink_pretty(const char *path)
+{
+    pretty_sink_priv_t *p = calloc(1, sizeof(*p));
+    if (!p) return NULL;
+    bool to_stdout = (!path || !strcmp(path, "-"));
+    p->fp         = to_stdout ? stdout : fopen(path, "w");
+    if (!p->fp) { free(p); return NULL; }
+    p->use_color  = isatty(fileno(p->fp));
+    np_sink_t *s = calloc(1, sizeof(*s));
+    if (!s) { if (!to_stdout) fclose(p->fp); free(p); return NULL; }
+    s->ops  = &pretty_sink_ops;
+    s->priv = p;
+    snprintf(s->name, sizeof(s->name), "pretty:%s", to_stdout ? "stdout" : path);
+    return s;
+}
+
+/* ------------------------------------------------------------------ */
 /*  TUN/TAP sink                                                        */
 /* ------------------------------------------------------------------ */
 

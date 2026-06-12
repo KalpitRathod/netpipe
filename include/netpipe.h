@@ -252,6 +252,7 @@ np_sink_t *np_sink_json(const char *path);         /* newline-delimited JSON */
 np_sink_t *np_sink_hex(const char *path);          /* human hex dump         */
 np_sink_t *np_sink_stats(const char *path);        /* periodic statistics    */
 np_sink_t *np_sink_null(void);                     /* /dev/null sink         */
+np_sink_t *np_sink_pretty(const char *path);       /* tshark-style display   */
 np_sink_t *np_sink_tuntap(const char *uri);        /* TUN/TAP inject sink    */
 np_sink_t *np_sink_socket(const char *uri);        /* Remote socket sink     */
 void       np_sink_free(np_sink_t *s);
