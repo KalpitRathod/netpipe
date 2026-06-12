@@ -168,7 +168,7 @@ typedef struct np_packet {
     const np_layer_t *app;       /* http / dns / tls  */
 
     /* internal scratch space for decoded structs */
-    uint8_t          scratch[512];
+    uint8_t          scratch[8192];
     size_t           scratch_used;
 
     /* stats / metadata */
