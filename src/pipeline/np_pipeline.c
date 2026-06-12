@@ -129,10 +129,16 @@ np_err_t np_pipeline_run(np_pipeline_t *pl)
             np_packet_t *pkt = NULL;
             np_err_t e = pl->sources[si]->ops->next(pl->sources[si], &pkt);
 
-            if (e == NP_ERR_EOF || e == NP_ERR_TIMEOUT) {
+            if (e == NP_ERR_EOF) {
+                /* Source is done (end of file, or pcap_breakloop called) */
                 NP_LOG_INFO("source '%s' exhausted", pl->sources[si]->name);
                 exhausted[si] = true;
                 active--;
+                continue;
+            }
+            if (e == NP_ERR_TIMEOUT) {
+                /* pcap_next_ex returned 0: no packet in this read window.
+                   This is normal for live capture — just try again.        */
                 continue;
             }
             if (e != NP_OK || !pkt) continue;

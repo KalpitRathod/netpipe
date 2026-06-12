@@ -329,9 +329,11 @@ np_err_t np_demux_packet(np_packet_t *pkt, np_linktype_t linktype)
             if (after_len >= sizeof(ip4_hdr_t)) {
                 const ip4_hdr_t *ip = (const ip4_hdr_t *)after_eth;
                 uint8_t ihl = (ip->version_ihl & 0x0f) * 4;
-                net_data = after_eth + ihl;
-                net_len  = after_len - ihl;
-                ip_proto = ip->protocol;
+                if (after_len >= ihl) {
+                    net_data = after_eth + ihl;
+                    net_len  = after_len - ihl;
+                    ip_proto = ip->protocol;
+                }
             }
         } else if (et == 0x86DD) {
             decode_ip6(pkt, after_eth, after_len);
@@ -356,9 +358,11 @@ np_err_t np_demux_packet(np_packet_t *pkt, np_linktype_t linktype)
                 decode_ip4(pkt, data, len);
                 const ip4_hdr_t *ip = (const ip4_hdr_t *)data;
                 uint8_t ihl = (ip->version_ihl & 0x0f) * 4;
-                net_data = data + ihl;
-                net_len  = len  - ihl;
-                ip_proto = ip->protocol;
+                if (len >= ihl) {
+                    net_data = data + ihl;
+                    net_len  = len  - ihl;
+                    ip_proto = ip->protocol;
+                }
             } else if (ver == 6) {
                 decode_ip6(pkt, data, len);
                 const ip6_hdr_t *ip6 = (const ip6_hdr_t *)data;

@@ -122,7 +122,8 @@ static np_err_t json_sink_open(np_sink_t *s, np_linktype_t lt)
 {
     (void)lt;
     json_sink_priv_t *p = s->priv;
-    p->fp = fopen(p->path, "w");
+    bool to_stdout = strcmp(p->path, "-") == 0;
+    p->fp = to_stdout ? stdout : fopen(p->path, "w");
     if (!p->fp) { NP_LOG_ERROR("cannot open %s", p->path); return NP_ERR_IO; }
     NP_LOG_INFO("json sink: writing to '%s'", p->path);
     return NP_OK;
@@ -158,7 +159,7 @@ static np_err_t json_sink_write(np_sink_t *s, const np_packet_t *pkt)
 static void json_sink_close(np_sink_t *s)
 {
     json_sink_priv_t *p = s->priv;
-    if (p->fp) { fflush(p->fp); fclose(p->fp); p->fp = NULL; }
+    if (p->fp && p->fp != stdout) { fflush(p->fp); fclose(p->fp); p->fp = NULL; }
 }
 static void json_sink_free(np_sink_t *s) { json_sink_close(s); free(s->priv); free(s); }
 
@@ -250,7 +251,8 @@ static np_err_t stats_sink_open(np_sink_t *s, np_linktype_t lt)
 {
     (void)lt;
     stats_sink_priv_t *p = s->priv;
-    p->fp = fopen(p->path, "w");
+    bool to_stdout = strcmp(p->path, "-") == 0;
+    p->fp = to_stdout ? stdout : fopen(p->path, "w");
     if (!p->fp) { NP_LOG_ERROR("cannot open %s", p->path); return NP_ERR_IO; }
     p->last_report = time(NULL);
     NP_LOG_INFO("stats sink: reporting every %ds to '%s'", p->interval_s, p->path);
@@ -327,7 +329,7 @@ static void stats_sink_close(np_sink_t *s)
             (unsigned long)p->proto_count[5],
             (unsigned long)p->proto_count[6]);
         fflush(p->fp);
-        fclose(p->fp);
+        if (p->fp != stdout) fclose(p->fp);
         p->fp = NULL;
     }
 }

@@ -208,10 +208,10 @@ static const char *infer_fmt(const char *path)
 
 int main(int argc, char *argv[])
 {
-    print_banner();
     np_init();
 
     /* ---- Default options ---- */
+    bool quiet             = false;
     const char *iface      = NULL;
     const char *infile     = NULL;
     const char *outfile    = NULL;
@@ -246,7 +246,7 @@ int main(int argc, char *argv[])
         else if (!strcmp(a, "-p"))  { promisc   = 0; }
         else if (!strcmp(a, "-v"))  { np_log_set_level(NP_LOG_DEBUG); }
         else if (!strcmp(a, "-vv")) { np_log_set_level(NP_LOG_TRACE); }
-        else if (!strcmp(a, "-q"))  { np_log_set_level(NP_LOG_WARN); }
+        else if (!strcmp(a, "-q"))  { quiet = true; np_log_set_level(NP_LOG_WARN); }
         else if (!strcmp(a, "-no-color")) { no_color = true; }
         else if (!strcmp(a, "-i")) { NEED_ARG("-i"); iface      = argv[++i]; }
         else if (!strcmp(a, "-r")) { NEED_ARG("-r"); infile     = argv[++i]; }
@@ -267,6 +267,8 @@ int main(int argc, char *argv[])
     }
 
     if (no_color) np_log_set_color(false);
+
+    if (!quiet) print_banner();
 
     if (list_dev) { list_devices(); return 0; }
 
