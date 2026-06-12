@@ -55,6 +55,7 @@ static np_err_t pcap_sink_open(np_sink_t *s, np_linktype_t lt)
     switch (lt) {
     case NP_LINK_ETHERNET: dlt = DLT_EN10MB; break;
     case NP_LINK_LOOPBACK: dlt = DLT_NULL;   break;
+    case NP_LINK_LINUX_SLL: dlt = 113;       break;
     default:               dlt = DLT_RAW;    break;
     }
 

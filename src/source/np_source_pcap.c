@@ -33,6 +33,7 @@ static np_linktype_t pcap_lt_to_np(int dlt)
     case DLT_EN10MB: return NP_LINK_ETHERNET;
     case DLT_NULL:   return NP_LINK_LOOPBACK;
     case DLT_RAW:    return NP_LINK_RAW;
+    case 113:        return NP_LINK_LINUX_SLL; /* DLT_LINUX_SLL is 113 */
     default:         return NP_LINK_UNKNOWN;
     }
 }

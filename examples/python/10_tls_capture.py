@@ -42,8 +42,9 @@ def main():
     cmd = [NETPIPE, "-i", interface, "-port", "443", "-o", pcap_file, "-q"]
     netpipe_proc = subprocess.Popen(cmd)
     
-    # Give netpipe a second to start listening
-    time.sleep(1)
+    # Give netpipe a few seconds to initialize its BPF filter and start sniffing
+    # Otherwise we might miss the initial TLS ClientHello, which breaks decryption!
+    time.sleep(3)
 
     print(f"\033[1m[2]\033[0m Simulating a secure HTTPS Login POST request to https://httpbin.org/post...")
     print(f"    (Forcing curl to log encryption keys to {key_file})")
@@ -55,8 +56,9 @@ def main():
     
     # EXTREME TEST: Sending a simulated password over the TLS tunnel.
     # To a normal packet sniffer, this is 100% invisible.
+    # We force --http1.1 to ensure the tshark JSON parser easily finds the 'http' layer
     curl_cmd = [
-        "curl", "-s", "-X", "POST",
+        "curl", "-s", "-X", "POST", "--http1.1",
         "-d", "username=kalpit&password=EXTREME_SECRET_PASSWORD_123!!",
         "https://httpbin.org/post", "-o", "/dev/null"
     ]

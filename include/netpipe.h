@@ -57,6 +57,7 @@ typedef enum {
     NP_LINK_ETHERNET = 1,
     NP_LINK_RAW      = 101,
     NP_LINK_LOOPBACK = 108,
+    NP_LINK_LINUX_SLL = 113,
 } np_linktype_t;
 
 /* ------------------------------------------------------------------ */

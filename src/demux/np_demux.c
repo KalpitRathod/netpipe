@@ -346,6 +346,33 @@ np_err_t np_demux_packet(np_packet_t *pkt, np_linktype_t linktype)
         }
         break;
     }
+    case NP_LINK_LINUX_SLL: {
+        if (len < 16) return NP_ERR_PROTO;
+        uint16_t et = ntohs(*(const uint16_t *)(data + 14));
+        const uint8_t *after_eth = data + 16;
+        size_t         after_len = len  - 16;
+        if (et == 0x0800) {
+            decode_ip4(pkt, after_eth, after_len);
+            if (after_len >= sizeof(ip4_hdr_t)) {
+                const ip4_hdr_t *ip = (const ip4_hdr_t *)after_eth;
+                uint8_t ihl = (ip->version_ihl & 0x0f) * 4;
+                if (after_len >= ihl) {
+                    net_data = after_eth + ihl;
+                    net_len  = after_len - ihl;
+                    ip_proto = ip->protocol;
+                }
+            }
+        } else if (et == 0x86DD) {
+            decode_ip6(pkt, after_eth, after_len);
+            if (after_len >= sizeof(ip6_hdr_t)) {
+                const ip6_hdr_t *ip6 = (const ip6_hdr_t *)after_eth;
+                net_data = after_eth + sizeof(ip6_hdr_t);
+                net_len  = after_len - sizeof(ip6_hdr_t);
+                ip_proto = ip6->next_header;
+            }
+        }
+        break;
+    }
     case NP_LINK_LOOPBACK:
     case NP_LINK_RAW:
         /* Skip 4-byte loopback header if present */
