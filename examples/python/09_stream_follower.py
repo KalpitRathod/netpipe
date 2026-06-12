@@ -31,7 +31,8 @@ def main():
     interface = sys.argv[1]
     
     # We enable the TCP stream reassembler via -proc tcp-stream
-    cmd = [NETPIPE, "-i", interface, "-proc", "tcp-stream", "-fmt", "json", "-q"]
+    # We also filter by -port 80 to avoid showing encrypted HTTPS traffic which looks like garbled text!
+    cmd = [NETPIPE, "-i", interface, "-port", "80", "-proc", "tcp-stream", "-fmt", "json", "-q"]
     
     print(f"\033[1mTCP Stream Follower\033[0m on {interface}")
     print("Run \033[36mcurl http://neverssl.com\033[0m in another terminal to see HTTP reassembly!")
