@@ -39,6 +39,9 @@ SRCS := \
 	$(SRCDIR)/np_global.c \
 	$(SRCDIR)/log/np_log.c \
 	$(SRCDIR)/packet/np_packet.c \
+	$(SRCDIR)/bufpool/np_bufpool.c \
+	$(SRCDIR)/registry/np_registry.c \
+	$(SRCDIR)/evloop/np_evloop.c \
 	$(SRCDIR)/demux/np_demux.c \
 	$(SRCDIR)/pipeline/np_pipeline.c \
 	$(SRCDIR)/source/np_source_pcap.c \
