@@ -1,0 +1,168 @@
+# netpipe — Python Examples
+
+All examples pipe netpipe's JSON output (`-fmt json`) into Python.
+**No extra Python libraries needed** unless noted.
+
+```
+netpipe -i wlo1 -fmt json | python3 your_script.py
+# or each script launches netpipe as a subprocess automatically
+```
+
+---
+
+## How it works
+
+```
+netpipe -i wlo1 -fmt json -q
+│
+│  {"seq":1,"ts":"09:15:32.041","caplen":74,"wirelen":74,
+│   "flow_id":3145678,
+│   "layers":[
+│     {"proto":"ethernet","len":14},
+│     {"proto":"ipv4","len":20},
+│     {"proto":"udp","len":8},
+│     {"proto":"dns","len":32}
+│   ],
+│   "raw_hex":"ffffffffffff..."}
+│
+└──▶ Python reads one JSON object per line with json.loads()
+```
+
+Each packet is a Python dict. That's it — simple, composable, powerful.
+
+---
+
+## Examples
+
+| File | What it does | Root needed? |
+|------|-------------|:---:|
+| `00_quickstart.py` | Print protocol stack of every packet | ✅ live / ❌ file |
+| `01_dns_monitor.py` | Real-time DNS query monitor with DGA alerting | ✅ |
+| `02_traffic_dashboard.py` | Live ANSI terminal dashboard with bar charts | ✅ |
+| `03_http_sniffer.py` | HTTP request/response logger → JSONL | ✅ |
+| `04_anomaly_detector.py` | Flood / port-scan / large-pkt / new-proto detection | ✅ |
+| `05_pcap_report.py` | Offline PCAP → terminal report + HTML report | ❌ |
+| `06_bandwidth_recorder.py` | Per-second bandwidth CSV + matplotlib plot | ✅ |
+| `07_packet_firewall.py` | Passive policy firewall — alert on blocked IPs/ports | ✅ |
+
+---
+
+## Quick usage
+
+```bash
+# Build netpipe first
+cd /home/kalpit/Documents/netpipe
+make
+cd examples/python
+
+# 0. See 20 packets from a file
+python3 00_quickstart.py --file ../../test/sample.pcap
+
+# 0. Live capture (needs root)
+sudo python3 00_quickstart.py wlo1
+
+# 1. Watch what DNS your system resolves
+sudo python3 01_dns_monitor.py wlo1
+
+# 2. Live protocol dashboard (updates every second)
+sudo python3 02_traffic_dashboard.py wlo1
+
+# 3. Log all HTTP requests to http_log.jsonl
+sudo python3 03_http_sniffer.py wlo1
+
+# 4. Detect anomalies
+sudo python3 04_anomaly_detector.py wlo1
+
+# 5. Analyse a pcap file, get HTML report
+python3 05_pcap_report.py capture.pcap --out report.html
+# open report.html in a browser
+
+# 6. Record 60s of bandwidth to CSV, then plot
+sudo python3 06_bandwidth_recorder.py wlo1 --duration 60 --plot
+# requires: pip install matplotlib
+
+# 7. Passive firewall monitor
+sudo python3 07_packet_firewall.py wlo1 --log violations.jsonl
+```
+
+---
+
+## JSON packet format
+
+```python
+{
+    "seq":     1,              # global packet sequence number
+    "ts":      "09:15:32.041233",   # HH:MM:SS.microseconds
+    "caplen":  74,             # bytes captured
+    "wirelen": 74,             # bytes on wire
+    "flow_id": 3145678,        # 5-tuple hash (src_ip, dst_ip, sport, dport, proto)
+    "layers": [
+        {"proto": "ethernet", "len": 14},
+        {"proto": "ipv4",     "len": 20},
+        {"proto": "udp",      "len": 8},
+        {"proto": "dns",      "len": 32},
+    ],
+    "raw_hex": "ffffffffffff00..."  # first 32 bytes as hex string
+}
+```
+
+### Layer protocol names
+
+`ethernet`, `arp`, `ipv4`, `ipv6`, `icmp`, `tcp`, `udp`, `dns`, `http`, `tls`
+
+### Useful one-liners
+
+```python
+import subprocess, json
+
+# Stream packets from netpipe
+def packets(interface=None, file=None, proto=None, port=None, count=None):
+    cmd = ["../../build/bin/netpipe", "-fmt", "json", "-q"]
+    if interface: cmd += ["-i", interface]
+    if file:      cmd += ["-r", file]
+    if proto:     cmd += ["-proto", proto]
+    if port:      cmd += ["-port", str(port)]
+    if count:     cmd += ["-c", str(count)]
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL, text=True) as p:
+        for line in p.stdout:
+            try:    yield json.loads(line.strip())
+            except: pass
+
+# Count DNS packets
+dns_count = sum(1 for pkt in packets(file="cap.pcap")
+                if any(l["proto"] == "dns" for l in pkt["layers"]))
+
+# Find largest packets
+big = sorted(packets(file="cap.pcap"),
+             key=lambda p: p["caplen"], reverse=True)[:5]
+
+# All unique flow IDs
+flows = {pkt["flow_id"] for pkt in packets(file="cap.pcap")}
+print(f"{len(flows)} unique flows")
+```
+
+---
+
+## Combining with other tools
+
+```bash
+# Feed netpipe JSON into jq
+sudo netpipe -i wlo1 -fmt json -q | jq 'select(.layers[].proto == "dns")'
+
+# Write to file, analyse later
+sudo netpipe -i wlo1 -fmt json -q -c 10000 > packets.jsonl
+python3 05_pcap_report.py --from-jsonl packets.jsonl  # (future feature)
+
+# Save pcap AND stream JSON simultaneously
+sudo netpipe -i wlo1 -o session.pcap -fmt json | python3 01_dns_monitor.py --stdin
+```
+
+---
+
+## Requirements
+
+- Python 3.8+
+- `netpipe` binary at `../../build/bin/netpipe`
+- Root / `CAP_NET_RAW` for live capture
+- `matplotlib` only for `06_bandwidth_recorder.py --plot`
