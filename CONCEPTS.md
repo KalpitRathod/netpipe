@@ -235,6 +235,30 @@ Network engines cannot blindly assume a packet starts with an IP header. They mu
 
 ---
 
+## Concept 11: Application-Layer Decoding (HTTP & DNS)
+
+In early concepts, we treated the payload of TCP or UDP packets as opaque "raw bytes" (sometimes viewing them as hex or ascii strings). However, network engines like Wireshark and `netpipe` don't just stop at the transport layer—they parse the application layer (Layer 7) as well.
+
+This is extremely difficult in C because you cannot simply map a `struct` over a text-based protocol like HTTP (which uses unpredictable variable-length strings separated by `\r\n`). 
+
+**How `netpipe` Solves This:**
+Instead of constantly allocating and freeing memory (which destroys performance), `netpipe` uses a **Scratch Buffer**. Each packet has an 8KB scratch space. When the Demuxer detects an HTTP or DNS packet:
+1. It allocates a complex structure (like `np_http_msg_t` or `np_dns_msg_t`) directly inside that 8KB scratch buffer.
+2. It uses "zero-copy strings" (`np_str_t`) which are simply pointers back into the original raw packet array.
+3. It recursively uncompresses DNS name pointers or parses HTTP headers without duplicating any strings in memory.
+
+**The Code Experiment:**
+Run these two scripts to see the C-engine's native decoders perfectly dump HTTP and DNS data directly into JSON format for Python to read:
+
+```bash
+sudo python3 examples/python/12_http_parser_demo.py wlo1
+sudo python3 examples/python/13_dns_spy.py wlo1
+```
+
+You'll instantly see how `google.com` is resolved to an IPv4/IPv6 address via DNS, and how HTTP headers are beautifully organized into structured data.
+
+---
+
 ## Build Your Own Experiment
 
 You now know that:
@@ -244,6 +268,7 @@ You now know that:
 4. Streams are just ordered sequences of these packets.
 5. TLS encryption can be entirely bypassed if the endpoint's memory is compromised.
 6. The Link Layer determines exactly how to slice the first bytes of a packet.
+7. Application layers (like HTTP and DNS) can be natively parsed into zero-copy structures for high-performance extraction.
 
 Go into `examples/python/00_quickstart.py` and modify the code. Try to write a script that only prints packets where `pkt["caplen"] > 1000` (finding large data transfers), or write a script that counts how many times your computer uses `udp` versus `tcp`. 
 
