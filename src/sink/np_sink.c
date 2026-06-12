@@ -699,6 +699,7 @@ np_sink_t *np_sink_pretty(const char *path)
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <sys/uio.h>
 #include <net/if.h>
 #include <linux/if_tun.h>
 
@@ -757,10 +758,13 @@ static np_err_t tuntap_sink_write(np_sink_t *s, const np_packet_t *pkt)
         }
     } else {
         /* TAP = Layer 2: try eth layer first (Ethernet), else fall back to
-         * the first layer data (handles SLL-encapsulated PCAPs), else raw. */
+         * the net layer (and we will synthesize an Ethernet header below). */
         if (pkt->eth && pkt->eth->data && pkt->eth->len > 0) {
             buf    = pkt->eth->data;
             buflen = pkt->eth->len;
+        } else if (pkt->net && pkt->net->data && pkt->net->len > 0) {
+            buf    = pkt->net->data;
+            buflen = pkt->net->len;
         } else if (pkt->nlayers > 0 && pkt->layers[0].data && pkt->layers[0].len > 0) {
             buf    = pkt->layers[0].data;
             buflen = pkt->layers[0].len;
@@ -771,8 +775,27 @@ static np_err_t tuntap_sink_write(np_sink_t *s, const np_packet_t *pkt)
     }
 
     if (buf && buflen > 0) {
-        ssize_t n = write(p->fd, buf, buflen);
-        if (n < 0) return NP_ERR_IO;
+        if (!p->is_tun && !pkt->eth) {
+            /* Missing Ethernet header on a Layer 2 TAP interface.
+             * This happens when replaying SLL-captured PCAPs (like from wlo1).
+             * We must synthesize a 14-byte Ethernet header. */
+            uint8_t eth_hdr[14] = {
+                0,0,0,0,0,0, /* dst MAC */
+                0,0,0,0,0,0, /* src MAC */
+                0x08, 0x00   /* EtherType: default to IPv4 */
+            };
+            if (pkt->net && pkt->net->proto == NP_PROTO_IP6) {
+                eth_hdr[12] = 0x86; eth_hdr[13] = 0xDD;
+            }
+            struct iovec iov[2];
+            iov[0].iov_base = eth_hdr;
+            iov[0].iov_len  = 14;
+            iov[1].iov_base = (void *)buf;
+            iov[1].iov_len  = buflen;
+            if (writev(p->fd, iov, 2) < 0) return NP_ERR_IO;
+        } else {
+            if (write(p->fd, buf, buflen) < 0) return NP_ERR_IO;
+        }
     }
     return NP_OK;
 }

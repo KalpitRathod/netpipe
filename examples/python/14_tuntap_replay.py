@@ -106,7 +106,7 @@ def main() -> None:
     print("─" * 70)
     try:
         subprocess.run(
-            [NETPIPE, "-i", "tap0", "-c", str(CAPTURE_N), "-fmt", "pretty", "-q"],
+            [NETPIPE, "-i", "tap0", "-c", str(CAPTURE_N), "-fmt", "pretty", "-f", "tcp", "-q"],
             check=True,
         )
     except subprocess.CalledProcessError:
