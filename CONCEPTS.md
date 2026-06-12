@@ -188,6 +188,33 @@ By reconstructing the stream, `netpipe` transcends from a low-level packet captu
 
 ---
 
+## Concept 9: TLS Decryption & The Illusion of Privacy
+
+Earlier, we learned that HTTPS traffic is entirely encrypted and looks like garbled text on the wire (Concept 6). Because modern TLS uses *Forward Secrecy*, passively recording the packets is not enough to decrypt them later—the encryption keys are ephemeral and discarded immediately.
+
+However, HTTPS only protects your data **in transit**. If an attacker compromises one of the endpoints (like your laptop or the server), they can extract the symmetric encryption keys (the "Pre-Master Secrets") directly from the application's memory before the encryption happens. 
+
+If you have both the captured packets (`.pcap`) and the session keys (`tls_keys.log`), you can completely decrypt the HTTPS tunnel.
+
+**The Code Experiment:**
+We have built two scripts to demonstrate this:
+1. The Capture Tool forces `curl` to dump its encryption keys while `netpipe` silently records the structured PCAP traffic:
+```bash
+sudo python3 examples/python/10_tls_capture.py wlo1
+```
+
+2. The Decryptor Tool takes the captured traffic and the stolen keys, and completely strips away the TLS encryption:
+```bash
+python3 examples/python/11_tls_decryptor.py encrypted_traffic.pcap tls_keys.log
+```
+
+**Can this decrypt passwords?**
+**YES.** Once the TLS tunnel is decrypted using the session keys, *everything* inside it becomes 100% visible in plaintext. If you logged into a website during the capture, your exact password, your session cookies, credit card numbers, and every API request you made are exposed. 
+
+This proves a fundamental cybersecurity principle: **Encryption protects the pipe, but endpoint security protects the data.** If a virus on your computer can log your `SSLKEYLOGFILE`, your HTTPS traffic is fully compromised.
+
+---
+
 ## Build Your Own Experiment
 
 You now know that:
@@ -195,6 +222,7 @@ You now know that:
 2. They are structured in layers (Eth → IP → TCP → App).
 3. `netpipe` turns these raw bytes into simple C structs or Python JSON objects.
 4. Streams are just ordered sequences of these packets.
+5. TLS encryption can be entirely bypassed if the endpoint's memory is compromised.
 
 Go into `examples/python/00_quickstart.py` and modify the code. Try to write a script that only prints packets where `pkt["caplen"] > 1000` (finding large data transfers), or write a script that counts how many times your computer uses `udp` versus `tcp`. 
 
