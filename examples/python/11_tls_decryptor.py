@@ -112,13 +112,21 @@ def main():
             file_data = http_layer.get("http.file_data")
             if file_data:
                 print("\nDecrypted Payload:")
-                # Truncate if it's too long
                 data_str = str(file_data)
+                
+                # Wireshark often outputs the file_data as colon-separated hex.
+                # Let's decode it to ASCII so the user can read it!
+                if ":" in data_str and all(c in "0123456789abcdefABCDEF:" for c in data_str):
+                    try:
+                        data_str = bytes.fromhex(data_str.replace(":", "")).decode("ascii", errors="ignore")
+                    except Exception:
+                        pass
+
                 if len(data_str) > 500:
                     data_str = data_str[:500] + " ... [TRUNCATED]"
                 
                 # Highlight password string for the extreme test demo
-                data_str = data_str.replace("password=", "\033[41;97m password= \033[0m")
+                data_str = data_str.replace("password", "\033[41;97m password \033[0m")
                 print(data_str)
 
         elif http2_layer:

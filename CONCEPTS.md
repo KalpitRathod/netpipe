@@ -215,14 +215,32 @@ This proves a fundamental cybersecurity principle: **Encryption protects the pip
 
 ---
 
+## Concept 10: Interface Encapsulation & Linux Cooked Capture (SLL)
+
+You might assume that all network interfaces output standard **Ethernet** packets (which start with a 14-byte MAC address header). However, when you use packet sniffing libraries (`libpcap`), the Operating System abstracts the physical hardware. 
+
+Different interfaces return data encapsulated differently (this is called the **Data Link Type** or **DLT**):
+* A standard wired connection (`eth0`) usually returns `DLT_EN10MB` (Ethernet).
+* The "any" interface or certain Wi-Fi adapters (`wlo1`) often return `DLT_LINUX_SLL` (Linux Cooked Capture).
+* A VPN interface (`tun0`) might return `DLT_RAW` (Raw IP, with no hardware addresses at all).
+
+**The Bug We Encountered:**
+During our extreme HTTPS capture test, the `netpipe` engine did not know how to handle the 16-byte `LINUX_SLL` header. It accidentally classified the packets as "Raw IP", which caused Wireshark to misinterpret the MAC addresses as invalid IP addresses. This broke the entire decryption pipeline because Wireshark could not find the TCP layer! 
+
+**The Lesson:**
+Network engines cannot blindly assume a packet starts with an IP header. They must read the interface's Link-Layer Type and apply the correct byte-offsets. We fixed `netpipe` by teaching its core Demuxer (`np_demux.c`) to parse SLL headers before extracting the IP packets.
+
+---
+
 ## Build Your Own Experiment
 
 You now know that:
 1. Packets are raw bytes.
-2. They are structured in layers (Eth → IP → TCP → App).
+2. They are structured in layers (Eth/SLL → IP → TCP → App).
 3. `netpipe` turns these raw bytes into simple C structs or Python JSON objects.
 4. Streams are just ordered sequences of these packets.
 5. TLS encryption can be entirely bypassed if the endpoint's memory is compromised.
+6. The Link Layer determines exactly how to slice the first bytes of a packet.
 
 Go into `examples/python/00_quickstart.py` and modify the code. Try to write a script that only prints packets where `pkt["caplen"] > 1000` (finding large data transfers), or write a script that counts how many times your computer uses `udp` versus `tcp`. 
 
