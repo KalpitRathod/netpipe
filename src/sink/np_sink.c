@@ -456,6 +456,136 @@ np_sink_t *np_sink_null(void)
     return s;
 }
 
+/* ------------------------------------------------------------------ */
+/*  TUN/TAP sink                                                        */
+/* ------------------------------------------------------------------ */
+
+#ifdef __linux__
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <linux/if_tun.h>
+
+typedef struct {
+    int fd;
+    char dev[IFNAMSIZ];
+    bool is_tun;
+} tuntap_sink_priv_t;
+
+static np_err_t tuntap_sink_open(np_sink_t *s, np_linktype_t lt)
+{
+    (void)lt;
+    tuntap_sink_priv_t *p = s->priv;
+    if ((p->fd = open("/dev/net/tun", O_RDWR)) < 0) {
+        NP_LOG_ERROR("%s", "tuntap: failed to open /dev/net/tun (try running as root)");
+        return NP_ERR_GENERIC;
+    }
+    
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    
+    ifr.ifr_flags = (short)((p->is_tun ? IFF_TUN : IFF_TAP) | IFF_NO_PI);
+    if (p->dev[0]) {
+        snprintf(ifr.ifr_name, IFNAMSIZ, "%s", p->dev);
+    }
+    
+    if (ioctl(p->fd, TUNSETIFF, (void *) &ifr) < 0) {
+        NP_LOG_ERROR("tuntap: ioctl(TUNSETIFF) failed on %s", p->dev);
+        close(p->fd);
+        p->fd = -1;
+        return NP_ERR_GENERIC;
+    }
+    
+    strcpy(p->dev, ifr.ifr_name);
+    NP_LOG_INFO("tuntap: opened %s device: %s", p->is_tun ? "TUN" : "TAP", p->dev);
+    
+    return NP_OK;
+}
+
+static np_err_t tuntap_sink_write(np_sink_t *s, const np_packet_t *pkt)
+{
+    tuntap_sink_priv_t *p = s->priv;
+    if (p->fd < 0) return NP_ERR_GENERIC;
+    
+    if (p->is_tun) {
+        if (pkt->net && pkt->net->data && pkt->net->len > 0) {
+            ssize_t n = write(p->fd, pkt->net->data, pkt->net->len);
+            if (n < 0) return NP_ERR_IO;
+        }
+    } else {
+        if (pkt->eth && pkt->eth->data && pkt->eth->len > 0) {
+            ssize_t n = write(p->fd, pkt->eth->data, pkt->eth->len);
+            if (n < 0) return NP_ERR_IO;
+        } else if (pkt->nlayers > 0 && pkt->layers[0].proto == NP_PROTO_RAW) {
+            ssize_t n = write(p->fd, pkt->raw, pkt->caplen);
+            if (n < 0) return NP_ERR_IO;
+        }
+    }
+    return NP_OK;
+}
+
+static void tuntap_sink_close(np_sink_t *s)
+{
+    tuntap_sink_priv_t *p = s->priv;
+    if (p->fd >= 0) {
+        close(p->fd);
+        p->fd = -1;
+    }
+}
+
+static void tuntap_sink_free(np_sink_t *s)
+{
+    tuntap_sink_close(s);
+    free(s->priv);
+    free(s);
+}
+
+static const struct np_sink_ops tuntap_sink_ops = {
+    .open  = tuntap_sink_open,
+    .write = tuntap_sink_write,
+    .close = tuntap_sink_close,
+    .free  = tuntap_sink_free,
+};
+
+np_sink_t *np_sink_tuntap(const char *uri)
+{
+    bool is_tun = false;
+    char dev_name[16] = {0};
+    
+    if (strncmp(uri, "tun://", 6) == 0) {
+        is_tun = true;
+        strncpy(dev_name, uri + 6, sizeof(dev_name) - 1);
+    } else if (strncmp(uri, "tap://", 6) == 0) {
+        is_tun = false;
+        strncpy(dev_name, uri + 6, sizeof(dev_name) - 1);
+    } else {
+        return NULL;
+    }
+
+    tuntap_sink_priv_t *p = calloc(1, sizeof(*p));
+    if (!p) return NULL;
+    
+    p->fd = -1;
+    p->is_tun = is_tun;
+    strcpy(p->dev, dev_name);
+    
+    np_sink_t *s = calloc(1, sizeof(*s));
+    if (!s) { free(p); return NULL; }
+    
+    s->ops  = &tuntap_sink_ops;
+    s->priv = p;
+    snprintf(s->name, sizeof(s->name), "tuntap:%s", p->dev);
+    return s;
+}
+#else
+np_sink_t *np_sink_tuntap(const char *uri) {
+    (void)uri;
+    NP_LOG_ERROR("tuntap sink is only supported on Linux");
+    return NULL;
+}
+#endif
+
 void np_sink_free(np_sink_t *s)
 {
     if (s && s->ops && s->ops->free) s->ops->free(s);

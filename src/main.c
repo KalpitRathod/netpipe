@@ -343,14 +343,18 @@ int main(int argc, char *argv[])
 
     /* Sinks */
     if (outfile) {
-        const char *eff_fmt = fmt ? fmt : infer_fmt(outfile);
         np_sink_t *out_sink = NULL;
-
-        if (!strcmp(eff_fmt, "json"))  out_sink = np_sink_json(outfile);
-        else if (!strcmp(eff_fmt, "hex"))   out_sink = np_sink_hex(outfile);
-        else if (!strcmp(eff_fmt, "stats")) out_sink = np_sink_stats(outfile);
-        else if (!strcmp(eff_fmt, "null"))  out_sink = np_sink_null();
-        else                                out_sink = np_sink_pcap(outfile);
+        
+        if (!strncmp(outfile, "tun://", 6) || !strncmp(outfile, "tap://", 6)) {
+            out_sink = np_sink_tuntap(outfile);
+        } else {
+            const char *eff_fmt = fmt ? fmt : infer_fmt(outfile);
+            if (!strcmp(eff_fmt, "json"))       out_sink = np_sink_json(outfile);
+            else if (!strcmp(eff_fmt, "hex"))   out_sink = np_sink_hex(outfile);
+            else if (!strcmp(eff_fmt, "stats")) out_sink = np_sink_stats(outfile);
+            else if (!strcmp(eff_fmt, "null"))  out_sink = np_sink_null();
+            else                                out_sink = np_sink_pcap(outfile);
+        }
 
         if (!out_sink) { NP_LOG_ERROR("%s", "failed to create output sink"); return 1; }
         np_pipeline_add_sink(pl, out_sink);
