@@ -286,30 +286,30 @@ static void decode_http(np_packet_t *pkt, np_layer_t *layer)
     const uint8_t *crlf = find_crlf(p, len);
     if (!crlf) return;
     
-    size_t line_len = crlf - p;
+    size_t line_len = (size_t)(crlf - p);
     msg->is_request = (line_len < 5 || memcmp(p, "HTTP/", 5) != 0);
     
     if (msg->is_request) {
         const uint8_t *sp1 = find_char(p, line_len, ' ');
         if (sp1) {
             msg->method.str = (const char *)p;
-            msg->method.len = sp1 - p;
+            msg->method.len = (size_t)(sp1 - p);
             
-            const uint8_t *sp2 = find_char(sp1 + 1, line_len - (sp1 + 1 - p), ' ');
+            const uint8_t *sp2 = find_char(sp1 + 1, line_len - (size_t)(sp1 + 1 - p), ' ');
             if (sp2) {
                 msg->path.str = (const char *)(sp1 + 1);
-                msg->path.len = sp2 - (sp1 + 1);
+                msg->path.len = (size_t)(sp2 - (sp1 + 1));
                 msg->version.str = (const char *)(sp2 + 1);
-                msg->version.len = crlf - (sp2 + 1);
+                msg->version.len = (size_t)(crlf - (sp2 + 1));
             }
         }
     } else {
         const uint8_t *sp1 = find_char(p, line_len, ' ');
         if (sp1) {
             msg->version.str = (const char *)p;
-            msg->version.len = sp1 - p;
+            msg->version.len = (size_t)(sp1 - p);
             
-            const uint8_t *sp2 = find_char(sp1 + 1, line_len - (sp1 + 1 - p), ' ');
+            const uint8_t *sp2 = find_char(sp1 + 1, line_len - (size_t)(sp1 + 1 - p), ' ');
             if (sp2) {
                 int code = 0;
                 for (const uint8_t *c = sp1 + 1; c < sp2; c++) {
@@ -317,13 +317,13 @@ static void decode_http(np_packet_t *pkt, np_layer_t *layer)
                 }
                 msg->status_code = code;
                 msg->status_phrase.str = (const char *)(sp2 + 1);
-                msg->status_phrase.len = crlf - (sp2 + 1);
+                msg->status_phrase.len = (size_t)(crlf - (sp2 + 1));
             }
         }
     }
     
     p = crlf + 2;
-    len -= (p - layer->data);
+    len -= (size_t)(p - layer->data);
     
     while (len > 0) {
         crlf = find_crlf(p, len);
@@ -338,21 +338,21 @@ static void decode_http(np_packet_t *pkt, np_layer_t *layer)
         }
         
         if (msg->num_headers < NP_MAX_HTTP_HEADERS) {
-            size_t hlen = crlf - p;
+            size_t hlen = (size_t)(crlf - p);
             const uint8_t *colon = find_char(p, hlen, ':');
             if (colon) {
                 np_http_header_t *h = &msg->headers[msg->num_headers++];
                 h->name.str = (const char *)p;
-                h->name.len = colon - p;
+                h->name.len = (size_t)(colon - p);
                 
                 const uint8_t *v = colon + 1;
                 while (v < crlf && (*v == ' ' || *v == '\t')) v++;
                 h->value.str = (const char *)v;
-                h->value.len = crlf - v;
+                h->value.len = (size_t)(crlf - v);
             }
         }
         
-        len -= (crlf + 2 - p);
+        len -= (size_t)(crlf + 2 - p);
         p = crlf + 2;
     }
     
