@@ -93,7 +93,7 @@ np_processor_t *np_processor_rate_limit(uint64_t bytes_per_sec)
 {
     rate_priv_t *p = malloc(sizeof(*p)); if (!p) return NULL;
     p->bytes_per_sec = bytes_per_sec;
-    p->bucket = (double)bytes_per_sec;
+    p->bucket = 0.0; /* Start empty to prevent initial burst */
     p->last_time_ns = get_time_ns();
     
     np_processor_t *proc = calloc(1, sizeof(*proc));

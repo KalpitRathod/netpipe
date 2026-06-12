@@ -259,6 +259,32 @@ You'll instantly see how `google.com` is resolved to an IPv4/IPv6 address via DN
 
 ---
 
+## Concept 12: TUN/TAP Injection (Active Replay)
+
+So far, we've only **read** packets from the network (Passive Capture). But what if we want to forge packets or replay a previous capture back into the live network?
+
+Linux provides virtual network devices called **TUN** (Layer 3 - IP) and **TAP** (Layer 2 - Ethernet). When you write raw bytes to `/dev/net/tun`, the kernel treats them exactly as if they arrived on a real physical network card! 
+
+`netpipe` includes a `tuntap` sink. If you output to `tap://tap0`, `netpipe` asks the kernel to create a virtual `tap0` interface and writes every processed packet directly into the kernel's networking stack. This is the foundation of VPNs and active Man-in-the-Middle (MitM) tools.
+
+---
+
+## Concept 13: Traffic Shaping & Rate Limiting
+
+Network processors don't just inspect data; they can modify or delay it. 
+If you replay a 1GB PCAP file into a TAP interface, `netpipe` will process it as fast as your CPU allows (often within milliseconds), causing massive network spikes and dropping packets.
+
+To simulate realistic network conditions (or throttle attacks), we use a **Token Bucket Rate Limiter**. This algorithm mathematically delays packets so that the output byte rate exactly matches a defined limit (e.g., `-rate 10000` for 10KB/s). 
+
+**The Code Experiment:**
+Run this script to see `netpipe` read an old PCAP file, rate-limit the packets, and inject them into a virtual `tap0` interface while `tshark` listens to the kernel proving the packets are real!
+
+```bash
+sudo python3 examples/python/14_tuntap_replay.py
+```
+
+---
+
 ## Build Your Own Experiment
 
 You now know that:
