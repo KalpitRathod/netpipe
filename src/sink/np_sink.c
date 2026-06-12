@@ -780,8 +780,8 @@ static np_err_t tuntap_sink_write(np_sink_t *s, const np_packet_t *pkt)
              * This happens when replaying SLL-captured PCAPs (like from wlo1).
              * We must synthesize a 14-byte Ethernet header. */
             uint8_t eth_hdr[14] = {
-                0,0,0,0,0,0, /* dst MAC */
-                0,0,0,0,0,0, /* src MAC */
+                0x02, 0x00, 0x00, 0x00, 0x00, 0x01, /* dst MAC */
+                0x02, 0x00, 0x00, 0x00, 0x00, 0x02, /* src MAC */
                 0x08, 0x00   /* EtherType: default to IPv4 */
             };
             if (pkt->net && pkt->net->proto == NP_PROTO_IP6) {

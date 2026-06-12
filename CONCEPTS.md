@@ -268,13 +268,13 @@ Linux provides virtual network devices:
 
 By writing raw binary packet arrays to the `/dev/net/tun` character device descriptor with the `IFF_TAP` flag enabled, the kernel's network stack processes those bytes exactly as if they arrived from a physical network interface card (NIC). 
 
-`netpipe` natively includes a `tuntap` sink. When you set the output to `tap://tap0`, it asks the kernel to create a transient virtual `tap0` interface and blindly injects every packet from the pipeline directly into the system routing tables.
+`netpipe` natively includes a `tuntap` sink. When you set the output to `tun://tun0`, it asks the kernel to create a transient virtual `tun0` interface and blindly injects every packet from the pipeline directly into the system routing tables.
 
 **The Code Experiment:**
 ```bash
-sudo python3 examples/python/14_tuntap_replay.py
+sudo python3 examples/python/14_tun_replay.py
 ```
-You will watch `tshark` natively capturing injected packets directly off the kernel `tap0` interface, proving the kernel believes the traffic is real. The underlying C call is simply:
+You will watch `netpipe` natively capturing injected packets directly off the kernel `tun0` interface, proving the kernel believes the traffic is real. The underlying C call is simply:
 ```c
 write(tap_fd, pkt->raw, pkt->caplen);  // kernel receives this as a physical frame
 ```
@@ -295,13 +295,13 @@ Instead of a simple constant delay, this mathematical algorithm accumulates "tok
 
 **The Code Experiment:**
 ```bash
-sudo python3 examples/python/14_tuntap_replay.py
+sudo python3 examples/python/14_tun_replay.py
 ```
 The script replays `encrypted_traffic.pcap` at exactly 500 bytes per second. You will see `tshark` capturing packets with timestamps spread seconds apart, not milliseconds—proof that the token bucket is mathematically controlling the injection cadence.
 
 You can also replay at wire speed with no limit:
 ```bash
-sudo ./build/bin/netpipe -r encrypted_traffic.pcap -o tap://tap0
+sudo ./build/bin/netpipe -r encrypted_traffic.pcap -o tun://tun0
 ```
 
 ---
