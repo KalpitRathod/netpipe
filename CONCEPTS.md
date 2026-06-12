@@ -213,6 +213,9 @@ python3 examples/python/11_tls_decryptor.py encrypted_traffic.pcap tls_keys.log
 
 This proves a fundamental cybersecurity principle: **Encryption protects the pipe, but endpoint security protects the data.** If a virus on your computer can log your `SSLKEYLOGFILE`, your HTTPS traffic is fully compromised.
 
+**The "Gotcha" of Decryption:**
+To decrypt a TLS session, you **must** capture the very first packets of the connection (the `ClientHello` and `ServerHello` handshake). If your packet sniffer starts recording even a millisecond *after* the connection is established, the decryptor will fail because it cannot match the captured keys to the specific stream. This is why our capture script intentionally pauses for 3 seconds to ensure `netpipe` is fully listening before it launches `curl`.
+
 ---
 
 ## Concept 10: Interface Encapsulation & Linux Cooked Capture (SLL)
