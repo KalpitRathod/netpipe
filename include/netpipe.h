@@ -61,6 +61,41 @@ typedef enum {
 } np_linktype_t;
 
 /* ------------------------------------------------------------------ */
+/*  Protocol Layer Structs                                              */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    const char *str;
+    size_t      len;
+} np_str_t;
+
+#define NP_MAX_HTTP_HEADERS 32
+
+typedef struct {
+    np_str_t name;
+    np_str_t value;
+} np_http_header_t;
+
+typedef struct {
+    bool is_request;
+    
+    /* Request fields */
+    np_str_t method;
+    np_str_t path;
+    np_str_t version;
+    
+    /* Response fields */
+    int      status_code;
+    np_str_t status_phrase;
+    
+    int              num_headers;
+    np_http_header_t headers[NP_MAX_HTTP_HEADERS];
+    
+    const uint8_t   *body;
+    size_t           body_len;
+} np_http_msg_t;
+
+/* ------------------------------------------------------------------ */
 /*  Protocol layer IDs                                                  */
 /* ------------------------------------------------------------------ */
 

@@ -260,6 +260,105 @@ static bool looks_like_tls(const uint8_t *payload, size_t len)
     return (ct >= 20 && ct <= 23) && maj == 3 && min <= 4;
 }
 
+static const uint8_t *find_crlf(const uint8_t *buf, size_t len) {
+    for (size_t i = 0; i + 1 < len; i++) {
+        if (buf[i] == '\r' && buf[i+1] == '\n') return buf + i;
+    }
+    return NULL;
+}
+
+static const uint8_t *find_char(const uint8_t *buf, size_t len, char c) {
+    for (size_t i = 0; i < len; i++) {
+        if (buf[i] == c) return buf + i;
+    }
+    return NULL;
+}
+
+static void decode_http(np_packet_t *pkt, np_layer_t *layer)
+{
+    np_http_msg_t *msg = np_packet_scratch_alloc(pkt, sizeof(np_http_msg_t));
+    if (!msg) return;
+    memset(msg, 0, sizeof(*msg));
+    
+    const uint8_t *p = layer->data;
+    size_t len = layer->len;
+    
+    const uint8_t *crlf = find_crlf(p, len);
+    if (!crlf) return;
+    
+    size_t line_len = crlf - p;
+    msg->is_request = (line_len < 5 || memcmp(p, "HTTP/", 5) != 0);
+    
+    if (msg->is_request) {
+        const uint8_t *sp1 = find_char(p, line_len, ' ');
+        if (sp1) {
+            msg->method.str = (const char *)p;
+            msg->method.len = sp1 - p;
+            
+            const uint8_t *sp2 = find_char(sp1 + 1, line_len - (sp1 + 1 - p), ' ');
+            if (sp2) {
+                msg->path.str = (const char *)(sp1 + 1);
+                msg->path.len = sp2 - (sp1 + 1);
+                msg->version.str = (const char *)(sp2 + 1);
+                msg->version.len = crlf - (sp2 + 1);
+            }
+        }
+    } else {
+        const uint8_t *sp1 = find_char(p, line_len, ' ');
+        if (sp1) {
+            msg->version.str = (const char *)p;
+            msg->version.len = sp1 - p;
+            
+            const uint8_t *sp2 = find_char(sp1 + 1, line_len - (sp1 + 1 - p), ' ');
+            if (sp2) {
+                int code = 0;
+                for (const uint8_t *c = sp1 + 1; c < sp2; c++) {
+                    if (*c >= '0' && *c <= '9') code = code * 10 + (*c - '0');
+                }
+                msg->status_code = code;
+                msg->status_phrase.str = (const char *)(sp2 + 1);
+                msg->status_phrase.len = crlf - (sp2 + 1);
+            }
+        }
+    }
+    
+    p = crlf + 2;
+    len -= (p - layer->data);
+    
+    while (len > 0) {
+        crlf = find_crlf(p, len);
+        if (!crlf) break;
+        
+        if (crlf == p) {
+            p = crlf + 2;
+            len -= 2;
+            msg->body = p;
+            msg->body_len = len;
+            break;
+        }
+        
+        if (msg->num_headers < NP_MAX_HTTP_HEADERS) {
+            size_t hlen = crlf - p;
+            const uint8_t *colon = find_char(p, hlen, ':');
+            if (colon) {
+                np_http_header_t *h = &msg->headers[msg->num_headers++];
+                h->name.str = (const char *)p;
+                h->name.len = colon - p;
+                
+                const uint8_t *v = colon + 1;
+                while (v < crlf && (*v == ' ' || *v == '\t')) v++;
+                h->value.str = (const char *)v;
+                h->value.len = crlf - v;
+            }
+        }
+        
+        len -= (crlf + 2 - p);
+        p = crlf + 2;
+    }
+    
+    layer->decoded = msg;
+}
+
 static np_err_t decode_app(np_packet_t *pkt,
                            const uint8_t *payload, size_t len,
                            uint16_t src_port, uint16_t dst_port,
@@ -285,7 +384,10 @@ static np_err_t decode_app(np_packet_t *pkt,
 
     if (app_proto != NP_PROTO_RAW) {
         np_layer_t *l = np_packet_push_layer(pkt, app_proto, payload, len);
-        if (l) pkt->app = l;
+        if (l) {
+            pkt->app = l;
+            if (app_proto == NP_PROTO_HTTP) decode_http(pkt, l);
+        }
     }
 
     return NP_OK;

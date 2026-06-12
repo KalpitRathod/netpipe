@@ -130,6 +130,19 @@ static np_err_t json_sink_open(np_sink_t *s, np_linktype_t lt)
     return NP_OK;
 }
 
+static void fprint_json_str(FILE *fp, const char *str, size_t len) {
+    fputc('"', fp);
+    for (size_t i = 0; i < len; i++) {
+        char c = str[i];
+        if (c == '"' || c == '\\') { fputc('\\', fp); fputc(c, fp); }
+        else if (c == '\n') fputs("\\n", fp);
+        else if (c == '\r') fputs("\\r", fp);
+        else if (c == '\t') fputs("\\t", fp);
+        else if (c >= 0x20 && c <= 0x7e) fputc(c, fp);
+    }
+    fputc('"', fp);
+}
+
 static np_err_t json_sink_write(np_sink_t *s, const np_packet_t *pkt)
 {
     json_sink_priv_t *p = s->priv;
@@ -158,6 +171,28 @@ static np_err_t json_sink_write(np_sink_t *s, const np_packet_t *pkt)
             fprintf(p->fp, "%02x", pkt->stream_data[i]);
         }
         fprintf(p->fp, "\"");
+    }
+
+    if (pkt->app && pkt->app->proto == NP_PROTO_HTTP && pkt->app->decoded) {
+        const np_http_msg_t *http = pkt->app->decoded;
+        fprintf(p->fp, ",\"http\":{");
+        if (http->is_request) {
+            fprintf(p->fp, "\"method\":"); fprint_json_str(p->fp, http->method.str, http->method.len);
+            fprintf(p->fp, ",\"path\":"); fprint_json_str(p->fp, http->path.str, http->path.len);
+            fprintf(p->fp, ",\"version\":"); fprint_json_str(p->fp, http->version.str, http->version.len);
+        } else {
+            fprintf(p->fp, "\"status\":%d,", http->status_code);
+            fprintf(p->fp, "\"phrase\":"); fprint_json_str(p->fp, http->status_phrase.str, http->status_phrase.len);
+            fprintf(p->fp, ",\"version\":"); fprint_json_str(p->fp, http->version.str, http->version.len);
+        }
+        fprintf(p->fp, ",\"headers\":{");
+        for (int i = 0; i < http->num_headers; i++) {
+            if (i > 0) fprintf(p->fp, ",");
+            fprint_json_str(p->fp, http->headers[i].name.str, http->headers[i].name.len);
+            fprintf(p->fp, ":");
+            fprint_json_str(p->fp, http->headers[i].value.str, http->headers[i].value.len);
+        }
+        fprintf(p->fp, "}}");
     }
 
     fprintf(p->fp, "}\n");

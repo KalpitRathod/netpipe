@@ -548,7 +548,7 @@ netpipe/
 ### Planned (the roadmap to v1.0)
 
 - [x] **TCP stream reassembly** — stitch fragments into byte streams
-- [ ] **Full HTTP/1.1 parser** — method, path, headers, body
+- [x] **Full HTTP/1.1 parser** — method, path, headers, body
 - [ ] **DNS response decoder** — extract A/AAAA/CNAME answers
 - [ ] **TUN/TAP inject sink** — replay packets back into the kernel
 - [ ] **Socket sink** — forward packets to a remote host (`-o socket://host:port`)
