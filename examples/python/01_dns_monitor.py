@@ -30,28 +30,64 @@ ALERT_COLOUR  = "\033[1;31m"  # bold red
 INFO_COLOUR   = "\033[36m"    # cyan
 RESET         = "\033[0m"
 
-def decode_dns_name(raw_hex: str) -> str:
-    """
-    Decode the first DNS question name from a raw hex payload string.
-    DNS payload starts after the 12-byte header (24 hex chars).
-    """
+def decode_dns_name(raw: bytes, offset: int) -> str:
+    """Decode a DNS wire-format name starting at `offset`."""
+    labels = []
+    visited = set()
+    pos = offset
     try:
-        data = bytes.fromhex(raw_hex)
-        # DNS header is 12 bytes; question section follows
-        pos = 12
-        labels = []
-        while pos < len(data):
-            length = data[pos]
+        while pos < len(raw):
+            if pos in visited:
+                break
+            visited.add(pos)
+            length = raw[pos]
             if length == 0:
                 break
-            if (length & 0xC0) == 0xC0:  # compression pointer
-                break
+            if (length & 0xC0) == 0xC0:      # compression pointer
+                if pos + 1 >= len(raw):
+                    break
+                ptr = ((length & 0x3F) << 8) | raw[pos + 1]
+                pos = ptr
+                continue
             pos += 1
-            labels.append(data[pos:pos+length].decode("ascii", errors="replace"))
+            labels.append(raw[pos:pos + length].decode("ascii", errors="replace"))
             pos += length
-        return ".".join(labels) if labels else "(unknown)"
     except Exception:
-        return "(parse error)"
+        pass
+    return ".".join(labels) if labels else ""
+
+def extract_dns(raw_hex: str):
+    """
+    Extract DNS question names from a raw frame.
+    Returns list of (name, is_response) tuples.
+    """
+    try:
+        raw = bytes.fromhex(raw_hex)
+    except ValueError:
+        return []
+
+    # DNS over UDP: Eth(14) + IP(20) + UDP(8) = offset 42
+    dns_offsets = [42]
+    # DNS over TCP (port 53): Eth(14)+IP(20)+TCP(20)+2-byte length prefix = 56
+    dns_offsets.append(56)
+
+    results = []
+    for off in dns_offsets:
+        if off + 12 >= len(raw):
+            continue
+        d = raw[off:]
+        if len(d) < 12:
+            continue
+        flags     = (d[2] << 8) | d[3]
+        qdcount   = (d[4] << 8) | d[5]
+        is_resp   = bool(flags & 0x8000)
+        if qdcount == 0 or qdcount > 16:
+            continue
+        name = decode_dns_name(d, 12)
+        if name and "." in name:
+            results.append((name, is_resp))
+            break
+    return results
 
 def main():
     ap = argparse.ArgumentParser()
@@ -87,43 +123,27 @@ def main():
                 continue
 
             raw_hex = pkt.get("raw_hex", "")
-            # Determine query vs response from flags byte in DNS header
-            # flags are bytes 2-3 of DNS payload
-            # DNS payload starts inside the UDP payload; raw_hex is full frame
-            # We parse raw_hex to find DNS data
-            domain = decode_dns_name(raw_hex)
+            for domain, is_response in extract_dns(raw_hex):
+                if is_response and not args.show_responses:
+                    continue
+                
+                ptype = "RESP " if is_response else "QUERY"
+                ts    = pkt["ts"].split(".")[0]  # HH:MM:SS
 
-            # Detect query vs response:
-            # In the raw_hex the DNS header starts after Eth(14)+IP(20)+UDP(8) = 42 bytes
-            is_response = False
-            try:
-                eth_ip_udp = 14 + 20 + 8  # bytes
-                flags_offset = eth_ip_udp * 2 + 4  # +4 hex chars for DNS ID
-                flags = int(raw_hex[flags_offset:flags_offset+4], 16)
-                is_response = bool(flags & 0x8000)
-            except Exception:
-                pass
+                if not is_response:
+                    query_counter[domain] += 1
+                    count = query_counter[domain]
 
-            if is_response and not args.show_responses:
-                continue
+                    # Alert on threshold breach
+                    if count >= args.alert_threshold and domain not in alerted:
+                        alerted.add(domain)
+                        print(f"\n{ALERT_COLOUR}⚠ ALERT: '{domain}' queried {count} times — possible DGA/C2!{RESET}\n")
 
-            ptype = "RESP " if is_response else "QUERY"
-            ts    = pkt["ts"].split(".")[0]  # HH:MM:SS
-
-            if not is_response:
-                query_counter[domain] += 1
-                count = query_counter[domain]
-
-                # Alert on threshold breach
-                if count >= args.alert_threshold and domain not in alerted:
-                    alerted.add(domain)
-                    print(f"\n{ALERT_COLOUR}⚠ ALERT: '{domain}' queried {count} times — possible DGA/C2!{RESET}\n")
-
-                colour = ALERT_COLOUR if domain in alerted else INFO_COLOUR
-                print(f"{ts:<12}  {colour}{ptype}{RESET}  {domain}  "
-                      f"(\033[2m×{count}\033[0m)")
-            else:
-                print(f"{ts:<12}  {ptype}  {domain}")
+                    colour = ALERT_COLOUR if domain in alerted else INFO_COLOUR
+                    print(f"{ts:<12}  {colour}{ptype}{RESET}  {domain}  "
+                          f"(\033[2m×{count}\033[0m)")
+                else:
+                    print(f"{ts:<12}  {ptype}  {domain}")
 
 if __name__ == "__main__":
     main()

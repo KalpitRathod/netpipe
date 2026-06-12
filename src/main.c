@@ -268,6 +268,9 @@ int main(int argc, char *argv[])
 
     if (no_color) np_log_set_color(false);
 
+    /* Automatically suppress banner if JSON output is requested on stdout */
+    if (fmt && !strcmp(fmt, "json") && !outfile) quiet = true;
+
     if (!quiet) print_banner();
 
     if (list_dev) { list_devices(); return 0; }

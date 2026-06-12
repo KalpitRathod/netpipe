@@ -37,7 +37,8 @@ void np_pipeline_free(np_pipeline_t *pl)
     for (int i = 0; i < pl->nprocessors; i++) {
         if (pl->processors[i]->ops->free)
             pl->processors[i]->ops->free(pl->processors[i]);
-        free(pl->processors[i]);
+        else
+            free(pl->processors[i]);
     }
     for (int i = 0; i < pl->nsinks;      i++) np_sink_free(pl->sinks[i]);
 

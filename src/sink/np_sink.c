@@ -145,8 +145,8 @@ static np_err_t json_sink_write(np_sink_t *s, const np_packet_t *pkt)
                 pname(pkt->layers[i].proto), pkt->layers[i].len);
     }
 
-    /* Embed first 32 bytes of raw as hex string */
-    size_t dump = pkt->caplen < 32 ? pkt->caplen : 32;
+    /* Embed raw packet as hex string (up to 1500 bytes) */
+    size_t dump = pkt->caplen < 1500 ? pkt->caplen : 1500;
     fprintf(p->fp, "],\"raw_hex\":\"");
     for (size_t i = 0; i < dump; i++) fprintf(p->fp, "%02x", pkt->raw[i]);
     fprintf(p->fp, "\"}\n");
