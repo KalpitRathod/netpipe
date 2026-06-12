@@ -151,12 +151,50 @@ Even though the website is fully encrypted and secure, `netpipe` is able to extr
 
 ---
 
+## Concept 8: TCP Stream Reassembly (Stitching the Pieces)
+
+Up to this point, we've treated every packet as an isolated, standalone event. However, network applications don't think in terms of "packets"—they think in terms of "streams". When you download a 10MB image, your browser doesn't receive one massive 10MB packet. The web server breaks the image down into roughly 7,000 tiny packets (usually 1500 bytes each) and sends them individually over TCP.
+
+If a script just inspects single packets, it can only see fragments of the image. The true power of Deep Packet Inspection (DPI) lies in **TCP Stream Reassembly**: buffering all those individual packets in memory, ordering them by their `TCP Sequence Number`, and stitching them back into a contiguous byte stream.
+
+**The Code Experiment:**
+`netpipe` includes a C-level stream processor that maintains an internal buffer for active TCP flows. When enabled, it outputs a `stream_hex` field alongside `raw_hex`. Let's test it out using our new script.
+
+Open two terminals. In Terminal 1, run the stream follower script:
+```bash
+sudo python3 examples/python/09_stream_follower.py wlo1
+```
+
+In Terminal 2, use `curl` to make a plaintext HTTP request:
+```bash
+curl http://neverssl.com
+```
+
+**What you will see:**
+The Python script is completely ignoring individual packet boundaries. Instead, it reads the cumulative `stream_hex` buffer maintained by `netpipe`. You will see the literal ASCII text of the HTTP request and response printed directly to your terminal exactly as the applications see it!
+
+```text
+[Flow 302194883] GET / HTTP/1.1
+[Flow 302194883] Host: neverssl.com
+[Flow 302194883] User-Agent: curl/7.88.1
+[Flow 302194883] Accept: */*
+[Flow 302194883] 
+[Flow 302194883] HTTP/1.1 200 OK
+[Flow 302194883] Content-Type: text/html
+...
+```
+
+By reconstructing the stream, `netpipe` transcends from a low-level packet capture tool into an application-layer analysis engine!
+
+---
+
 ## Build Your Own Experiment
 
 You now know that:
 1. Packets are raw bytes.
 2. They are structured in layers (Eth → IP → TCP → App).
 3. `netpipe` turns these raw bytes into simple C structs or Python JSON objects.
+4. Streams are just ordered sequences of these packets.
 
 Go into `examples/python/00_quickstart.py` and modify the code. Try to write a script that only prints packets where `pkt["caplen"] > 1000` (finding large data transfers), or write a script that counts how many times your computer uses `udp` versus `tcp`. 
 
