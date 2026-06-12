@@ -12,7 +12,15 @@ Usage:
 
 import subprocess, sys, json, argparse
 
-NETPIPE = "../../build/bin/netpipe"
+import pathlib as _pl
+_HERE = _pl.Path(__file__).resolve().parent
+NETPIPE = str(next(
+    (p for p in [
+        _HERE / "../../build/bin/netpipe",
+        _pl.Path("/usr/local/bin/netpipe"),
+        _pl.Path("/usr/bin/netpipe"),
+    ] if p.exists()), _HERE / "../../build/bin/netpipe"
+))
 
 def main():
     ap = argparse.ArgumentParser()

@@ -22,7 +22,15 @@ Usage:
 import subprocess, sys, json, argparse, time, signal
 from datetime import datetime
 
-NETPIPE = "../../build/bin/netpipe"
+import pathlib as _pl
+_HERE = _pl.Path(__file__).resolve().parent
+NETPIPE = str(next(
+    (p for p in [
+        _HERE / "../../build/bin/netpipe",
+        _pl.Path("/usr/local/bin/netpipe"),
+        _pl.Path("/usr/bin/netpipe"),
+    ] if p.exists()), _HERE / "../../build/bin/netpipe"
+))
 
 # ── Policy definition ────────────────────────────────────────────────────────
 POLICY = {

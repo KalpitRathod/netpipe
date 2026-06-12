@@ -16,7 +16,15 @@ import subprocess, sys, json, argparse, re
 from collections import Counter
 from datetime import datetime
 
-NETPIPE = "../../build/bin/netpipe"
+import pathlib as _pl
+_HERE = _pl.Path(__file__).resolve().parent
+NETPIPE = str(next(
+    (p for p in [
+        _HERE / "../../build/bin/netpipe",
+        _pl.Path("/usr/local/bin/netpipe"),
+        _pl.Path("/usr/bin/netpipe"),
+    ] if p.exists()), _HERE / "../../build/bin/netpipe"
+))
 
 ALERT_COLOUR  = "\033[1;31m"  # bold red
 INFO_COLOUR   = "\033[36m"    # cyan

@@ -2,7 +2,22 @@
 """
 examples/python/03_http_sniffer.py
 ────────────────────────────────────
-Sniff HTTP requests in real time and log them to a file.
+Sniff HTTP/1.1 requests in real time and log them to a file.
+
+⚠️  IMPORTANT — WHY GOOGLE / MODERN SITES DON'T APPEAR:
+    Google, Facebook, YouTube and virtually every modern website
+    use HTTPS (port 443, TLS-encrypted). This sniffer only sees
+    PLAIN HTTP (port 80, unencrypted) because TLS content cannot
+    be decoded without the private key.
+
+    What you WILL see on port 80:
+      • Plain HTTP sites (rare today)
+      • Some IoT devices
+      • Internal LAN services
+      • Some CDN health-check endpoints
+
+    To see HTTPS hostnames (not content), use:
+      sudo python3 08_browser_spy.py wlo1
 
 Extracts: timestamp, method, URL, Host header, response code, size.
 Writes a structured log to http_log.jsonl (append mode).
@@ -15,7 +30,15 @@ Usage:
 import subprocess, sys, json, argparse, re, signal, time
 from datetime import datetime
 
-NETPIPE = "../../build/bin/netpipe"
+import pathlib as _pl
+_HERE = _pl.Path(__file__).resolve().parent
+NETPIPE = str(next(
+    (p for p in [
+        _HERE / "../../build/bin/netpipe",
+        _pl.Path("/usr/local/bin/netpipe"),
+        _pl.Path("/usr/bin/netpipe"),
+    ] if p.exists()), _HERE / "../../build/bin/netpipe"
+))
 
 REQUEST_RE  = re.compile(
     rb"^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|CONNECT)\s+(\S+)\s+HTTP/[\d.]+\r?\n"
