@@ -552,7 +552,7 @@ netpipe/
 - [x] **DNS response decoder** — extract A/AAAA/CNAME answers
 - [x] **TUN/TAP inject sink** — replay packets back into the kernel
 - [ ] **Socket sink** — forward packets to a remote host (`-o socket://host:port`)
-- [ ] **Rate-limiting processor** — token bucket, for traffic shaping
+- [x] **Rate-limiting processor** — token bucket, for traffic shaping
 - [ ] **Payload transform processor** — regex_replace, base64, hex encode
 - [ ] **Flow tracker** — maintain per-5-tuple state across packets
 - [ ] **PCAP-NG write support** — the modern pcap format

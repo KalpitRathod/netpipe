@@ -228,6 +228,7 @@ int main(int argc, char *argv[])
     bool        no_color   = false;
     uint16_t    port_num   = 0;
     bool        use_tcp_stream = false;
+    uint64_t    rate_bps   = 0;
 
     /* ---- Arg parsing ---- */
     for (int i = 1; i < argc; i++) {
@@ -261,6 +262,7 @@ int main(int argc, char *argv[])
         else if (!strcmp(a, "-T"))     { NEED_ARG("-T");     timeout_ms = atoi(argv[++i]); }
         else if (!strcmp(a, "-c"))     { NEED_ARG("-c");     count      = (uint64_t)strtoull(argv[++i], NULL, 10); }
         else if (!strcmp(a, "-port"))  { NEED_ARG("-port");  port_num   = (uint16_t)atoi(argv[++i]); }
+        else if (!strcmp(a, "-rate"))  { NEED_ARG("-rate");  rate_bps   = (uint64_t)strtoull(argv[++i], NULL, 10); }
         else if (!strcmp(a, "-proc"))  { 
             NEED_ARG("-proc");
             if (!strcmp(argv[++i], "tcp-stream")) use_tcp_stream = true;
@@ -339,6 +341,11 @@ int main(int argc, char *argv[])
         np_processor_t *sp = np_processor_tcp_stream();
         if (sp) np_pipeline_add_processor(pl, sp);
         else { NP_LOG_ERROR("%s", "failed to create tcp stream processor"); return 1; }
+    }
+    if (rate_bps > 0) {
+        np_processor_t *rp = np_processor_rate_limit(rate_bps);
+        if (rp) np_pipeline_add_processor(pl, rp);
+        else { NP_LOG_ERROR("%s", "failed to create rate limiter"); return 1; }
     }
 
     /* Sinks */

@@ -237,6 +237,7 @@ typedef struct np_processor np_processor_t;
 typedef np_err_t (*np_proc_fn)(np_packet_t *pkt, void *userdata);
 np_processor_t *np_processor_fn(np_proc_fn fn, void *userdata);
 np_processor_t *np_processor_tcp_stream(void);
+np_processor_t *np_processor_rate_limit(uint64_t bytes_per_sec);
 np_err_t        np_pipeline_add_processor(np_pipeline_t *pl, np_processor_t *proc);
 
 /* ------------------------------------------------------------------ */
