@@ -45,7 +45,7 @@ def main():
     # Give netpipe a second to start listening
     time.sleep(1)
 
-    print(f"\033[1m[2]\033[0m Making a secure HTTPS request to https://example.com...")
+    print(f"\033[1m[2]\033[0m Simulating a secure HTTPS Login POST request to https://httpbin.org/post...")
     print(f"    (Forcing curl to log encryption keys to {key_file})")
     
     # We use curl with SSLKEYLOGFILE. This extracts the symmetric AES master secrets
@@ -53,7 +53,13 @@ def main():
     env = os.environ.copy()
     env["SSLKEYLOGFILE"] = key_file
     
-    curl_cmd = ["curl", "-s", "https://example.com", "-o", "/dev/null"]
+    # EXTREME TEST: Sending a simulated password over the TLS tunnel.
+    # To a normal packet sniffer, this is 100% invisible.
+    curl_cmd = [
+        "curl", "-s", "-X", "POST",
+        "-d", "username=kalpit&password=EXTREME_SECRET_PASSWORD_123!!",
+        "https://httpbin.org/post", "-o", "/dev/null"
+    ]
     subprocess.run(curl_cmd, env=env)
 
     # Wait a moment for traffic to finish writing

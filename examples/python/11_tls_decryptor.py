@@ -116,6 +116,9 @@ def main():
                 data_str = str(file_data)
                 if len(data_str) > 500:
                     data_str = data_str[:500] + " ... [TRUNCATED]"
+                
+                # Highlight password string for the extreme test demo
+                data_str = data_str.replace("password=", "\033[41;97m password= \033[0m")
                 print(data_str)
 
         elif http2_layer:
@@ -135,7 +138,17 @@ def main():
             data = http2_layer.get("http2.data.data")
             if data:
                 print("\nDecrypted HTTP/2 Data Payload (Hex):")
-                print(data[:200] + "..." if len(data) > 200 else data)
+                payload_str = data[:200] + "..." if len(data) > 200 else data
+                # Attempt to decode hex for the extreme test demo just in case
+                try:
+                    decoded = bytes.fromhex(payload_str.replace(":", "")).decode('ascii', errors='ignore')
+                    if "password=" in decoded:
+                        decoded = decoded.replace("password=", "\033[41;97m password= \033[0m")
+                        print("\033[33m(Decoded ASCII):\033[0m " + decoded)
+                    else:
+                        print(payload_str)
+                except Exception:
+                    print(payload_str)
 
     print("\n\033[1mDecryption Complete.\033[0m")
 
