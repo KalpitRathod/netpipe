@@ -51,6 +51,7 @@ typedef struct np_buf {
 typedef struct np_bufpool {
     size_t          buf_capacity;  /* capacity of each buffer           */
     int             pool_size;     /* total slots allocated             */
+    void           *slab;          /* pointer to the allocated slab     */
 
     np_buf_t       *free_list;
     int             free_count;

@@ -1021,6 +1021,149 @@ np_sink_t *np_sink_socket(const char *uri)
     return s;
 }
 
+/* ------------------------------------------------------------------ */
+/*  PCAP-NG sink (native)                                             */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    FILE *fp;
+    char path[256];
+    np_linktype_t lt;
+} pcapng_sink_priv_t;
+
+static np_err_t pcapng_sink_open(np_sink_t *s, np_linktype_t lt)
+{
+    pcapng_sink_priv_t *p = s->priv;
+    p->lt = lt;
+
+    bool to_stdout = strcmp(p->path, "-") == 0;
+    p->fp = to_stdout ? stdout : fopen(p->path, "wb");
+    if (!p->fp) {
+        NP_LOG_ERROR("pcapng sink: cannot open '%s' for writing", p->path);
+        return NP_ERR_IO;
+    }
+
+    /* 1. Write Section Header Block (SHB) */
+    uint32_t shb_type = 0x0A0D0D0A;
+    uint32_t shb_len = 28;
+    uint32_t magic = 0x1A2B3C4D;
+    uint16_t major = 1;
+    uint16_t minor = 0;
+    int64_t sec_len = -1;
+
+    fwrite(&shb_type, 4, 1, p->fp);
+    fwrite(&shb_len, 4, 1, p->fp);
+    fwrite(&magic, 4, 1, p->fp);
+    fwrite(&major, 2, 1, p->fp);
+    fwrite(&minor, 2, 1, p->fp);
+    fwrite(&sec_len, 8, 1, p->fp);
+    fwrite(&shb_len, 4, 1, p->fp);
+
+    /* 2. Write Interface Description Block (IDB) */
+    uint32_t idb_type = 0x00000001;
+    uint32_t idb_len = 20;
+    uint16_t link_type = 1;
+    switch (lt) {
+        case NP_LINK_ETHERNET:  link_type = 1;   break;
+        case NP_LINK_LOOPBACK:  link_type = 108; break;
+        case NP_LINK_LINUX_SLL: link_type = 113; break;
+        default:                link_type = 1;   break;
+    }
+    uint16_t reserved = 0;
+    uint32_t snap_len = 65535;
+
+    fwrite(&idb_type, 4, 1, p->fp);
+    fwrite(&idb_len, 4, 1, p->fp);
+    fwrite(&link_type, 2, 1, p->fp);
+    fwrite(&reserved, 2, 1, p->fp);
+    fwrite(&snap_len, 4, 1, p->fp);
+    fwrite(&idb_len, 4, 1, p->fp);
+
+    fflush(p->fp);
+    NP_LOG_INFO("pcapng sink: writing to '%s'", p->path);
+    return NP_OK;
+}
+
+static np_err_t pcapng_sink_write(np_sink_t *s, const np_packet_t *pkt)
+{
+    pcapng_sink_priv_t *p = s->priv;
+    if (!p->fp) return NP_ERR_IO;
+
+    /* Calculate padding */
+    size_t padded_len = (pkt->caplen + 3) & ~3U;
+    size_t padding_bytes = padded_len - pkt->caplen;
+    uint32_t block_len = (uint32_t)(28 + padded_len + 4);
+
+    /* Calculate timestamp in microseconds resolution */
+    uint64_t ts_val = (uint64_t)pkt->ts.tv_sec * 1000000ULL + (uint64_t)pkt->ts.tv_nsec / 1000ULL;
+    uint32_t ts_high = (uint32_t)(ts_val >> 32);
+    uint32_t ts_low = (uint32_t)(ts_val & 0xFFFFFFFFULL);
+
+    uint32_t epb_type = 0x00000006;
+    uint32_t iface_id = 0;
+
+    fwrite(&epb_type, 4, 1, p->fp);
+    fwrite(&block_len, 4, 1, p->fp);
+    fwrite(&iface_id, 4, 1, p->fp);
+    fwrite(&ts_high, 4, 1, p->fp);
+    fwrite(&ts_low, 4, 1, p->fp);
+    fwrite(&pkt->caplen, 4, 1, p->fp);
+    fwrite(&pkt->wirelen, 4, 1, p->fp);
+
+    /* Write packet data */
+    fwrite(pkt->raw, 1, pkt->caplen, p->fp);
+
+    /* Write padding */
+    if (padding_bytes > 0) {
+        uint8_t pad[3] = {0, 0, 0};
+        fwrite(pad, 1, padding_bytes, p->fp);
+    }
+
+    /* Write trailing Block Total Length */
+    fwrite(&block_len, 4, 1, p->fp);
+
+    fflush(p->fp);
+    return NP_OK;
+}
+
+static void pcapng_sink_close(np_sink_t *s)
+{
+    pcapng_sink_priv_t *p = s->priv;
+    if (p->fp) {
+        if (p->fp != stdout) {
+            fclose(p->fp);
+        }
+        p->fp = NULL;
+    }
+}
+
+static void pcapng_sink_free(np_sink_t *s)
+{
+    pcapng_sink_close(s);
+    free(s->priv);
+    free(s);
+}
+
+static const struct np_sink_ops pcapng_sink_ops = {
+    .open  = pcapng_sink_open,
+    .write = pcapng_sink_write,
+    .close = pcapng_sink_close,
+    .free  = pcapng_sink_free,
+};
+
+np_sink_t *np_sink_pcapng(const char *path)
+{
+    pcapng_sink_priv_t *p = calloc(1, sizeof(*p));
+    if (!p) return NULL;
+    snprintf(p->path, sizeof(p->path), "%s", path);
+    np_sink_t *s = calloc(1, sizeof(*s));
+    if (!s) { free(p); return NULL; }
+    s->ops  = &pcapng_sink_ops;
+    s->priv = p;
+    snprintf(s->name, sizeof(s->name), "pcapng:%s", path);
+    return s;
+}
+
 void np_sink_free(np_sink_t *s)
 {
     if (s && s->ops && s->ops->free) s->ops->free(s);

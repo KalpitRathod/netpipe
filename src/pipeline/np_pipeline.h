@@ -13,6 +13,7 @@
 struct np_source_ops {
     np_err_t (*open )(np_source_t *src);
     np_err_t (*next )(np_source_t *src, np_packet_t **out);
+    void     (*stop )(np_source_t *src);
     void     (*close)(np_source_t *src);
     void     (*free )(np_source_t *src);
 };

@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "netpipe.h"
+#include "demux/np_demux.h"
 
 int main() {
     np_init();

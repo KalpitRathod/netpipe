@@ -45,16 +45,32 @@ SRCS := \
 	$(SRCDIR)/demux/np_demux.c \
 	$(SRCDIR)/pipeline/np_pipeline.c \
 	$(SRCDIR)/source/np_source_pcap.c \
+	$(SRCDIR)/source/np_source_ring.c \
 	$(SRCDIR)/filter/np_filter.c \
 	$(SRCDIR)/sink/np_sink.c \
 	$(SRCDIR)/processor/np_processor.c \
-	$(SRCDIR)/processor/np_tcp_stream.c
+	$(SRCDIR)/processor/np_tcp_stream.c \
+	$(SRCDIR)/processor/np_flow_tracker.c \
+	$(SRCDIR)/processor/np_lua.c
 
 # Library sources (everything except main.c)
 LIB_SRCS := $(filter-out $(SRCDIR)/main.c, $(SRCS))
 
 OBJS     := $(patsubst %.c, $(OBJDIR)/%.o, $(SRCS))
 LIB_OBJS := $(patsubst %.c, $(OBJDIR)/%.o, $(LIB_SRCS))
+
+# ------------------------------------------------------------------ #
+#  Lua Configuration                                                  #
+# ------------------------------------------------------------------ #
+
+LUA_LOCAL_DIR := $(CURDIR)/lua-5.4.7/install
+ifeq ($(wildcard $(LUA_LOCAL_DIR)/lib/liblua.a),)
+    LUA_CFLAGS  :=
+    LUA_LDFLAGS := -llua -lm -ldl
+else
+    LUA_CFLAGS  := -I$(LUA_LOCAL_DIR)/include
+    LUA_LDFLAGS := $(LUA_LOCAL_DIR)/lib/liblua.a -lm -ldl
+endif
 
 # ------------------------------------------------------------------ #
 #  Flags                                                               #
@@ -67,13 +83,14 @@ CFLAGS_BASE := \
 	-Wshadow -Wconversion \
 	-Wno-format-truncation \
 	-I$(INCDIR) \
+	$(LUA_CFLAGS) \
 	-D_GNU_SOURCE \
 	-D_POSIX_C_SOURCE=200809L
 
 CFLAGS_REL  := -O2 -DNDEBUG -fstack-protector-strong
 CFLAGS_DBG  := -O0 -g3 -fsanitize=address,undefined -fno-omit-frame-pointer
 
-LDFLAGS     := -lpcap -lpthread
+LDFLAGS     := -lpcap $(LUA_LDFLAGS) -lpthread
 LDFLAGS_DBG := $(LDFLAGS) -fsanitize=address,undefined
 
 # ------------------------------------------------------------------ #

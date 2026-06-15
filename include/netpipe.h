@@ -204,6 +204,7 @@ typedef struct np_source np_source_t;
 
 np_source_t *np_source_live(const char *device, int snaplen, int promisc, int timeout_ms);
 np_source_t *np_source_file(const char *path);
+np_source_t *np_source_ring(const char *device);
 void         np_source_free(np_source_t *src);
 np_err_t     np_pipeline_add_source(np_pipeline_t *pl, np_source_t *src);
 
@@ -238,6 +239,9 @@ typedef np_err_t (*np_proc_fn)(np_packet_t *pkt, void *userdata);
 np_processor_t *np_processor_fn(np_proc_fn fn, void *userdata);
 np_processor_t *np_processor_tcp_stream(void);
 np_processor_t *np_processor_rate_limit(uint64_t bytes_per_sec);
+np_processor_t *np_processor_payload_transform(const char *mode, const char *pattern, const char *replacement);
+np_processor_t *np_processor_flow_tracker(void);
+np_processor_t *np_processor_lua(const char *script_path);
 np_err_t        np_pipeline_add_processor(np_pipeline_t *pl, np_processor_t *proc);
 
 /* ------------------------------------------------------------------ */
@@ -248,6 +252,7 @@ struct np_sink;
 typedef struct np_sink np_sink_t;
 
 np_sink_t *np_sink_pcap(const char *path);
+np_sink_t *np_sink_pcapng(const char *path);
 np_sink_t *np_sink_json(const char *path);         /* newline-delimited JSON */
 np_sink_t *np_sink_hex(const char *path);          /* human hex dump         */
 np_sink_t *np_sink_stats(const char *path);        /* periodic statistics    */

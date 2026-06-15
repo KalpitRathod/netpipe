@@ -54,6 +54,7 @@ np_bufpool_t *np_bufpool_create(size_t buf_capacity, int pool_size)
     /* Allocate all blocks in one contiguous slab */
     uint8_t *slab = malloc((size_t)pool_size * block_size(buf_capacity));
     if (!slab) { free(pool); return NULL; }
+    pool->slab = slab;
 
     /* Initialise each block and thread it onto the free-list */
     pool->free_list  = NULL;
@@ -80,16 +81,12 @@ void np_bufpool_destroy(np_bufpool_t *pool)
 {
     if (!pool) return;
 
-    /* The slab starts at the first block */
-    if (pool->free_list) {
-        /* Walk to the beginning of the slab (lowest address) */
-        np_buf_t *first = pool->free_list;
-        np_buf_t *cur   = pool->free_list;
-        while (cur) {
-            if (cur < first) first = cur;
-            cur = cur->next_free;
+    if (pool->slab) {
+        for (int i = 0; i < pool->pool_size; i++) {
+            np_buf_t *b = block_at(pool->slab, pool->buf_capacity, i);
+            pthread_mutex_destroy(&b->reflock);
         }
-        free(first);
+        free(pool->slab);
     }
 
     pthread_mutex_destroy(&pool->lock);

@@ -153,7 +153,35 @@ void np_packet_print(const np_packet_t *pkt, FILE *fp)
         fprintf(fp, "%02x ", pkt->raw[i]);
         if ((i + 1) % 16 == 0) fprintf(fp, "\n│  ");
     }
-    fprintf(fp, "\n└──\n");
+    fprintf(fp, "\n");
+
+    if (pkt->stream_data && pkt->stream_len > 0) {
+        fprintf(fp, "│  Stream/Transformed Payload (len=%zu):\n│  ", pkt->stream_len);
+        bool is_printable = true;
+        for (size_t i = 0; i < pkt->stream_len; i++) {
+            uint8_t c = pkt->stream_data[i];
+            if ((c < 32 || c > 126) && c != '\t' && c != '\n' && c != '\r') {
+                is_printable = false;
+                break;
+            }
+        }
+        if (is_printable) {
+            size_t p_len = pkt->stream_len < 1000 ? pkt->stream_len : 1000;
+            fwrite(pkt->stream_data, 1, p_len, fp);
+            if (pkt->stream_len > 1000) fprintf(fp, "... [truncated]");
+            fprintf(fp, "\n");
+        } else {
+            size_t p_len = pkt->stream_len < 256 ? pkt->stream_len : 256;
+            for (size_t i = 0; i < p_len; i++) {
+                fprintf(fp, "%02x ", pkt->stream_data[i]);
+                if ((i + 1) % 16 == 0) fprintf(fp, "\n│  ");
+            }
+            if (pkt->stream_len > 256) fprintf(fp, "... [truncated]");
+            fprintf(fp, "\n");
+        }
+    }
+
+    fprintf(fp, "└──\n");
 }
 
 /* djb2-based 5-tuple hash — filled in by the protocol decoder */

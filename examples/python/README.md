@@ -44,6 +44,12 @@ Each packet is a Python dict. That's it — simple, composable, powerful.
 | `05_pcap_report.py` | Offline PCAP → terminal report + HTML report | ❌ |
 | `06_bandwidth_recorder.py` | Per-second bandwidth CSV + matplotlib plot | ✅ |
 | `07_packet_firewall.py` | Passive policy firewall — alert on blocked IPs/ports | ✅ |
+| `16_payload_transform.py` | Demonstrate payload transform processor modes (hex/base64/regex) | ❌ file / ✅ live |
+| `17_flow_tracker.py` | Track network sessions and print bidirectional flow statistics | ❌ file / ✅ live |
+| `18_pcapng_writer.py` | Write captured packets to native PCAP-NG and verify file integrity | ❌ file / ✅ live |
+| `19_lua_processor.py` | Run custom Lua scripts to hook into packet processing/filtering | ❌ file / ✅ live |
+| `20_multi_interface_parallel.py` | Capture from multiple interfaces/files concurrently using threads | ❌ file / ✅ live |
+| `21_zero_copy_ring.py` | High-performance zero-copy AF_PACKET + PACKET_MMAP capture | ❌ file / ✅ live |
 
 ---
 
@@ -83,6 +89,24 @@ sudo python3 06_bandwidth_recorder.py wlo1 --duration 60 --plot
 
 # 7. Passive firewall monitor
 sudo python3 07_packet_firewall.py wlo1 --log violations.jsonl
+
+# 16. Payload transformations (hex/base64/regex)
+python3 16_payload_transform.py --file ../../encrypted_traffic.pcap
+
+# 17. Flow tracking and connection state monitoring
+python3 17_flow_tracker.py --file ../../encrypted_traffic.pcap
+
+# 18. Native PCAP-NG writing and verification
+python3 18_pcapng_writer.py --file ../../encrypted_traffic.pcap
+
+# 19. Lua scripting processor hook
+python3 19_lua_processor.py --file ../../encrypted_traffic.pcap
+
+# 20. Concurrent multi-source packet capture and fan-in
+python3 20_multi_interface_parallel.py --file ../../encrypted_traffic.pcap
+
+# 21. High-performance zero-copy PACKET_MMAP capture
+python3 21_zero_copy_ring.py
 ```
 
 ---

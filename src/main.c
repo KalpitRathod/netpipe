@@ -74,6 +74,7 @@ static void usage(const char *prog)
         "Usage: %s [OPTIONS]\n\n"
         "Input:\n"
         "  -i <device>       Live capture on network interface (requires root)\n"
+        "  --ring            Enable Linux zero-copy packet ring buffer capture (AF_PACKET + PACKET_MMAP)\n"
         "  -r <file.pcap>    Read from pcap file\n"
         "  -D                List available capture devices and exit\n"
         "  -s <snaplen>      Snapshot length (default 65535)\n"
@@ -91,12 +92,15 @@ static void usage(const char *prog)
         "  -o tap://<dev>    Inject packets into a Linux TAP (Layer 2) virtual interface\n"
         "  -o tun://<dev>    Inject packets into a Linux TUN (Layer 3) virtual interface\n"
         "  -o socket://<h:p> Forward raw packets to a remote host over TCP\n"
-        "  -fmt <format>     Output format: pcap (default), json, hex, pretty, stats, null\n"
+        "  -fmt <format>     Output format: pcap (default), pcapng, json, hex, pretty, stats, null\n"
         "  -stats <file>     Write periodic statistics to file (use '-' for stdout)\n"
         "  -c <count>        Stop after capturing N packets\n"
         "\n"
         "Processing:\n"
         "  -proc tcp-stream  Enable TCP stream reassembly\n"
+        "  -proc flow-tracker Maintain per-5-tuple state across packets and print summary table\n"
+        "  -proc transform:<hex|base64|regex:pat:rep>  Apply transformation to payload\n"
+        "  -proc lua:<file.lua> Execute a Lua packet processing/filtering script\n"
         "  -rate <bps>       Rate-limit output to N bytes per second (token bucket)\n"
         "\n"
         "Logging:\n"
@@ -204,6 +208,7 @@ static const char *infer_fmt(const char *path)
 {
     const char *dot = strrchr(path, '.');
     if (!dot) return "pcap";
+    if (!strcasecmp(dot, ".pcapng")) return "pcapng";
     if (!strcasecmp(dot, ".pcap") || !strcasecmp(dot, ".cap")) return "pcap";
     if (!strcasecmp(dot, ".json") || !strcasecmp(dot, ".ndjson")) return "json";
     if (!strcasecmp(dot, ".txt")  || !strcasecmp(dot, ".hex")) return "hex";
@@ -221,9 +226,6 @@ int main(int argc, char *argv[])
 
     /* ---- Default options ---- */
     bool quiet             = false;
-    const char *iface      = NULL;
-    const char *infile     = NULL;
-    const char *outfile    = NULL;
     const char *fmt        = NULL;
     const char *bpf_expr   = NULL;
     const char *proto_str  = NULL;
@@ -237,7 +239,22 @@ int main(int argc, char *argv[])
     bool        no_color   = false;
     uint16_t    port_num   = 0;
     bool        use_tcp_stream = false;
+    bool        use_flow_tracker = false;
+    const char *lua_script_path = NULL;
     uint64_t    rate_bps   = 0;
+    bool        use_transform = false;
+    char        transform_mode[64] = {0};
+    char       *transform_pattern = NULL;
+    char       *transform_replacement = NULL;
+    bool        use_ring   = false;
+
+    const char *inputs[NP_MAX_SOURCES];
+    bool        input_is_file[NP_MAX_SOURCES];
+    int         n_inputs = 0;
+
+    const char *outputs[NP_MAX_SINKS];
+    const char *out_fmts[NP_MAX_SINKS];
+    int         n_outputs = 0;
 
     /* ---- Arg parsing ---- */
     for (int i = 1; i < argc; i++) {
@@ -255,13 +272,42 @@ int main(int argc, char *argv[])
         }
         else if (!strcmp(a, "-D"))  { list_dev  = true; }
         else if (!strcmp(a, "-p"))  { promisc   = 0; }
+        else if (!strcmp(a, "--ring") || !strcmp(a, "-ring")) { use_ring = true; }
         else if (!strcmp(a, "-v"))  { np_log_set_level(NP_LOG_DEBUG); }
         else if (!strcmp(a, "-vv")) { np_log_set_level(NP_LOG_TRACE); }
         else if (!strcmp(a, "-q"))  { quiet = true; np_log_set_level(NP_LOG_WARN); }
         else if (!strcmp(a, "-no-color")) { no_color = true; }
-        else if (!strcmp(a, "-i")) { NEED_ARG("-i"); iface      = argv[++i]; }
-        else if (!strcmp(a, "-r")) { NEED_ARG("-r"); infile     = argv[++i]; }
-        else if (!strcmp(a, "-o")) { NEED_ARG("-o"); outfile    = argv[++i]; }
+        else if (!strcmp(a, "-i")) {
+            NEED_ARG("-i");
+            if (n_inputs >= NP_MAX_SOURCES) {
+                fprintf(stderr, "error: maximum of %d inputs exceeded\n", NP_MAX_SOURCES);
+                return 1;
+            }
+            inputs[n_inputs] = argv[++i];
+            input_is_file[n_inputs] = false;
+            n_inputs++;
+        }
+        else if (!strcmp(a, "-r")) {
+            NEED_ARG("-r");
+            if (n_inputs >= NP_MAX_SOURCES) {
+                fprintf(stderr, "error: maximum of %d inputs exceeded\n", NP_MAX_SOURCES);
+                return 1;
+            }
+            inputs[n_inputs] = argv[++i];
+            input_is_file[n_inputs] = true;
+            n_inputs++;
+        }
+        else if (!strcmp(a, "-o")) {
+            NEED_ARG("-o");
+            if (n_outputs >= NP_MAX_SINKS) {
+                fprintf(stderr, "error: maximum of %d outputs exceeded\n", NP_MAX_SINKS);
+                return 1;
+            }
+            outputs[n_outputs] = argv[++i];
+            out_fmts[n_outputs] = fmt;
+            fmt = NULL; /* consumed */
+            n_outputs++;
+        }
         else if (!strcmp(a, "-fmt"))   { NEED_ARG("-fmt");   fmt        = argv[++i]; }
         else if (!strcmp(a, "-f"))     { NEED_ARG("-f");     bpf_expr   = argv[++i]; }
         else if (!strcmp(a, "-proto")) { NEED_ARG("-proto"); proto_str  = argv[++i]; }
@@ -274,8 +320,44 @@ int main(int argc, char *argv[])
         else if (!strcmp(a, "-rate"))  { NEED_ARG("-rate");  rate_bps   = (uint64_t)strtoull(argv[++i], NULL, 10); }
         else if (!strcmp(a, "-proc"))  { 
             NEED_ARG("-proc");
-            if (!strcmp(argv[++i], "tcp-stream")) use_tcp_stream = true;
-            else { fprintf(stderr, "unknown processor: %s\n", argv[i]); return 1; }
+            const char *proc_arg = argv[++i];
+            if (!strcmp(proc_arg, "tcp-stream")) {
+                use_tcp_stream = true;
+            } else if (!strcmp(proc_arg, "flow-tracker")) {
+                use_flow_tracker = true;
+            } else if (!strncmp(proc_arg, "lua:", 4)) {
+                lua_script_path = proc_arg + 4;
+            } else if (!strncmp(proc_arg, "transform:", 10)) {
+                use_transform = true;
+                const char *mode_part = proc_arg + 10;
+                if (!strncmp(mode_part, "regex:", 6)) {
+                    strcpy(transform_mode, "regex");
+                    const char *pat_start = mode_part + 6;
+                    const char *next_colon = strchr(pat_start, ':');
+                    if (next_colon) {
+                        size_t pat_len = (size_t)(next_colon - pat_start);
+                        transform_pattern = malloc(pat_len + 1);
+                        if (transform_pattern) {
+                            memcpy(transform_pattern, pat_start, pat_len);
+                            transform_pattern[pat_len] = '\0';
+                        }
+                        transform_replacement = strdup(next_colon + 1);
+                    } else {
+                        fprintf(stderr, "error: transform:regex requires pattern and replacement (e.g. transform:regex:pattern:replacement)\n");
+                        return 1;
+                    }
+                } else if (!strcmp(mode_part, "hex")) {
+                    strcpy(transform_mode, "hex");
+                } else if (!strcmp(mode_part, "base64")) {
+                    strcpy(transform_mode, "base64");
+                } else {
+                    fprintf(stderr, "error: unknown transform mode: %s (expected hex, base64, or regex:...)\n", mode_part);
+                    return 1;
+                }
+            } else {
+                fprintf(stderr, "unknown processor: %s\n", proc_arg);
+                return 1;
+            }
         }
         else {
             fprintf(stderr, "unknown option: %s  (use -h for help)\n", a);
@@ -286,15 +368,26 @@ int main(int argc, char *argv[])
     if (no_color) np_log_set_color(false);
 
     /* Automatically suppress banner if JSON output is requested on stdout */
-    if (fmt && !strcmp(fmt, "json") && !outfile) quiet = true;
+    bool json_to_stdout = false;
+    if (n_outputs == 0 && fmt && !strcmp(fmt, "json")) {
+        json_to_stdout = true;
+    } else {
+        for (int idx = 0; idx < n_outputs; idx++) {
+            if (!strcmp(outputs[idx], "-") && out_fmts[idx] && !strcmp(out_fmts[idx], "json")) {
+                json_to_stdout = true;
+                break;
+            }
+        }
+    }
+    if (json_to_stdout) quiet = true;
 
     if (!quiet) print_banner();
 
     if (list_dev) { list_devices(); return 0; }
 
     /* Validate */
-    if (!iface && !infile) {
-        fprintf(stderr, "error: specify an input with -i <device> or -r <file.pcap>\n"
+    if (n_inputs == 0) {
+        fprintf(stderr, "error: specify at least one input with -i <device> or -r <file.pcap>\n"
                         "       Use -D to list available devices.\n");
         usage(argv[0]);
         return 1;
@@ -305,22 +398,31 @@ int main(int argc, char *argv[])
     if (!pl) { NP_LOG_FATAL("%s", "out of memory"); return 1; }
     g_pipeline = pl;
 
-    /* Source */
-    np_source_t *src = iface
-        ? np_source_live(iface, snaplen, promisc, timeout_ms)
-        : np_source_file(infile);
+    /* Sources */
+    for (int idx = 0; idx < n_inputs; idx++) {
+        np_source_t *src;
+        if (input_is_file[idx]) {
+            src = np_source_file(inputs[idx]);
+        } else {
+            if (use_ring) {
+                src = np_source_ring(inputs[idx]);
+            } else {
+                src = np_source_live(inputs[idx], snaplen, promisc, timeout_ms);
+            }
+        }
 
-    if (!src) {
-        fprintf(stderr, "error: could not open input — do you need root for live capture?\n");
-        np_pipeline_free(pl);
-        return 1;
+        if (!src) {
+            fprintf(stderr, "error: could not open input '%s' — do you need root for live capture?\n", inputs[idx]);
+            np_pipeline_free(pl);
+            return 1;
+        }
+        np_pipeline_add_source(pl, src);
     }
-    np_pipeline_add_source(pl, src);
 
     /* Filters */
     if (bpf_expr) {
         np_filter_t *f = np_filter_bpf(bpf_expr);
-        if (!f) { NP_LOG_ERROR("bad BPF expression: %s", bpf_expr); return 1; }
+        if (!f) { NP_LOG_ERROR("bad BPF expression: %s", bpf_expr); np_pipeline_free(pl); return 1; }
         np_pipeline_add_filter(pl, f);
     }
     if (proto_str) {
@@ -336,7 +438,7 @@ int main(int argc, char *argv[])
     }
     if (host_str) {
         np_filter_t *hf = np_filter_host(host_str);
-        if (!hf) { NP_LOG_ERROR("bad host: %s", host_str); return 1; }
+        if (!hf) { NP_LOG_ERROR("bad host: %s", host_str); np_pipeline_free(pl); return 1; }
         np_pipeline_add_filter(pl, hf);
     }
 
@@ -349,34 +451,58 @@ int main(int argc, char *argv[])
     if (use_tcp_stream) {
         np_processor_t *sp = np_processor_tcp_stream();
         if (sp) np_pipeline_add_processor(pl, sp);
-        else { NP_LOG_ERROR("%s", "failed to create tcp stream processor"); return 1; }
+        else { NP_LOG_ERROR("%s", "failed to create tcp stream processor"); np_pipeline_free(pl); return 1; }
     }
     if (rate_bps > 0) {
         np_processor_t *rp = np_processor_rate_limit(rate_bps);
         if (rp) np_pipeline_add_processor(pl, rp);
-        else { NP_LOG_ERROR("%s", "failed to create rate limiter"); return 1; }
+        else { NP_LOG_ERROR("%s", "failed to create rate limiter"); np_pipeline_free(pl); return 1; }
+    }
+    if (use_transform) {
+        np_processor_t *tp = np_processor_payload_transform(transform_mode, transform_pattern, transform_replacement);
+        if (tp) np_pipeline_add_processor(pl, tp);
+        else { NP_LOG_ERROR("failed to create transform processor: %s", transform_mode); np_pipeline_free(pl); return 1; }
+    }
+    if (use_flow_tracker) {
+        np_processor_t *ftp = np_processor_flow_tracker();
+        if (ftp) np_pipeline_add_processor(pl, ftp);
+        else { NP_LOG_ERROR("%s", "failed to create flow tracker processor"); np_pipeline_free(pl); return 1; }
+    }
+    if (lua_script_path) {
+        np_processor_t *lp = np_processor_lua(lua_script_path);
+        if (lp) np_pipeline_add_processor(pl, lp);
+        else { NP_LOG_ERROR("failed to create Lua processor from script '%s'", lua_script_path); np_pipeline_free(pl); return 1; }
     }
 
     /* Sinks */
-    if (outfile) {
-        np_sink_t *out_sink = NULL;
-        
-        if (!strncmp(outfile, "tun://", 6) || !strncmp(outfile, "tap://", 6)) {
-            out_sink = np_sink_tuntap(outfile);
-        } else if (!strncmp(outfile, "socket://", 9)) {
-            out_sink = np_sink_socket(outfile);
-        } else {
-            const char *eff_fmt = fmt ? fmt : infer_fmt(outfile);
-            if (!strcmp(eff_fmt, "json"))       out_sink = np_sink_json(outfile);
-            else if (!strcmp(eff_fmt, "hex"))   out_sink = np_sink_hex(outfile);
-            else if (!strcmp(eff_fmt, "pretty")) out_sink = np_sink_pretty(outfile);
-            else if (!strcmp(eff_fmt, "stats")) out_sink = np_sink_stats(outfile);
-            else if (!strcmp(eff_fmt, "null"))  out_sink = np_sink_null();
-            else                                out_sink = np_sink_pcap(outfile);
-        }
+    if (n_outputs > 0) {
+        for (int idx = 0; idx < n_outputs; idx++) {
+            const char *outfile = outputs[idx];
+            const char *eff_fmt = out_fmts[idx];
+            np_sink_t *out_sink = NULL;
 
-        if (!out_sink) { NP_LOG_ERROR("%s", "failed to create output sink"); return 1; }
-        np_pipeline_add_sink(pl, out_sink);
+            if (!strncmp(outfile, "tun://", 6) || !strncmp(outfile, "tap://", 6)) {
+                out_sink = np_sink_tuntap(outfile);
+            } else if (!strncmp(outfile, "socket://", 9)) {
+                out_sink = np_sink_socket(outfile);
+            } else {
+                if (!eff_fmt) eff_fmt = infer_fmt(outfile);
+                if (!strcmp(eff_fmt, "json"))       out_sink = np_sink_json(outfile);
+                else if (!strcmp(eff_fmt, "hex"))   out_sink = np_sink_hex(outfile);
+                else if (!strcmp(eff_fmt, "pretty")) out_sink = np_sink_pretty(outfile);
+                else if (!strcmp(eff_fmt, "stats")) out_sink = np_sink_stats(outfile);
+                else if (!strcmp(eff_fmt, "null"))  out_sink = np_sink_null();
+                else if (!strcmp(eff_fmt, "pcapng")) out_sink = np_sink_pcapng(outfile);
+                else                                out_sink = np_sink_pcap(outfile);
+            }
+
+            if (!out_sink) {
+                NP_LOG_ERROR("failed to create output sink for '%s'", outfile);
+                np_pipeline_free(pl);
+                return 1;
+            }
+            np_pipeline_add_sink(pl, out_sink);
+        }
     } else if (fmt) {
         /* No -o but -fmt given → use stdout/- */
         np_sink_t *out_sink = NULL;
@@ -385,6 +511,7 @@ int main(int argc, char *argv[])
         else if (!strcmp(fmt, "pretty")) out_sink = np_sink_pretty("-");
         else if (!strcmp(fmt, "stats"))  out_sink = np_sink_stats("-");
         else if (!strcmp(fmt, "null"))   out_sink = np_sink_null();
+        else if (!strcmp(fmt, "pcapng")) out_sink = np_sink_pcapng("-");
         else {
             NP_LOG_WARN("format '%s' requires an output file (-o). Defaulting to pretty.", fmt);
             out_sink = np_sink_pretty("-");
@@ -411,6 +538,9 @@ int main(int argc, char *argv[])
     np_pipeline_free(pl);
     g_pipeline = NULL;
     np_cleanup();
+
+    if (transform_pattern) free(transform_pattern);
+    if (transform_replacement) free(transform_replacement);
 
     return ret == NP_OK ? 0 : 1;
 }

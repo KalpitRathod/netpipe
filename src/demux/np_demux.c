@@ -124,7 +124,9 @@ static np_err_t decode_eth(np_packet_t *pkt,
     const uint8_t *payload = data + sizeof(eth_hdr_t);
     size_t         paylen  = len  - sizeof(eth_hdr_t);
     if (et == 0x8100 && paylen >= 4) {
-        et      = ntohs(*(const uint16_t *)(payload + 2));
+        uint16_t v;
+        memcpy(&v, payload + 2, sizeof(v));
+        et      = ntohs(v);
         payload += 4;
         paylen  -= 4;
     }
@@ -178,8 +180,11 @@ static np_err_t decode_ip6(np_packet_t *pkt,
 
     /* basic flow hash from first 4 bytes of src+dst */
     uint32_t h = 5381;
-    h = hash_u32(h, *(uint32_t *)ip6->src);
-    h = hash_u32(h, *(uint32_t *)ip6->dst);
+    uint32_t src_w, dst_w;
+    memcpy(&src_w, ip6->src, sizeof(src_w));
+    memcpy(&dst_w, ip6->dst, sizeof(dst_w));
+    h = hash_u32(h, src_w);
+    h = hash_u32(h, dst_w);
     h ^= ip6->next_header;
     pkt->flow_id = h;
 

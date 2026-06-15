@@ -1,9 +1,35 @@
+# Build and library artifacts
 build/
 *.o
 *.d
 *.a
+
+# Local Lua build directory
+lua-5.4.7/install/
+lua-5.4.7/**/*.o
+lua-5.4.7/**/*.a
+lua-5.4.7/src/lua
+lua-5.4.7/src/luac
+
+# Captured packets and logs
 *.pcap
+*.pcapng
+*.cap
 *.json
 *.ndjson
+*.jsonl
 *.hex
+*.log
+
+# Python cache and environment
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# System files
 .DS_Store
+.vscode/
+.idea/

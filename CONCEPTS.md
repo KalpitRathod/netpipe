@@ -327,6 +327,38 @@ nc -l -p 9999 | tshark -r -
 sudo ./build/bin/netpipe -i wlo1 -c 50 -o socket://REMOTE_IP:9999
 ```
 
+# Concept 15: Concurrent Multi-Interface Capture & Queue Fan-In
+
+To capture traffic across multiple network interfaces in parallel (e.g. `eth0` and `wlan0`), a single-threaded round-robin capture loop faces major bottlenecks. If one interface has a high read timeout or gets blocked waiting for packets, the entire capture pipeline stalls.
+
+To solve this, `netpipe` implements a **Multi-threaded Producer-Consumer Architecture**:
+1. **Source Worker Threads**: The pipeline spawns a dedicated worker thread (`pthread_create`) for every configured packet source.
+2. **Thread-Safe Packet Queue**: A central bounded queue managed by a mutex and condition variables (`pthread_mutex_t`, `pthread_cond_t`) accumulates incoming packets.
+3. **Pipeline Consumer**: The main thread runs the processing loop, popping packets from the queue as they arrive and executing filters, processors, and sinks in an interleaved, order-preserved fashion.
+
+**Test it in Python:**
+```bash
+# Capture from two sources concurrently and verify they interleave
+python3 examples/python/20_multi_interface_parallel.py
+```
+
+---
+
+# Concept 16: Zero-Copy Ring-Buffer Capture (AF_PACKET + PACKET_MMAP)
+
+Standard packet capture (via standard system read/recv calls) introduces substantial kernel-to-user-space context switching overhead, copying every packet's data from kernel memory space to user-allocated buffers.
+
+Linux provides a high-performance alternative: **`AF_PACKET` + `PACKET_MMAP` (zero-copy ring buffers)**.
+1. **Raw Sockets**: By opening a raw socket with `AF_PACKET`, we gain direct access to raw layer 2 Ethernet frames.
+2. **Circular RX Ring**: By setting the `PACKET_RX_RING` socket option (`TPACKET_V2`), we configure a shared circular memory ring buffer between the kernel and the user application.
+3. **Zero-Copy Memory Mapping**: Using `mmap()`, the user process maps this circular buffer directly into its address space. When a packet arrives, the kernel writes it directly to the shared memory. The user space reads the data by checking status flags on the frames (e.g. `TP_STATUS_USER`), eliminating standard copy syscall overhead entirely.
+
+**Test it in Python:**
+```bash
+# Validate zero-copy CLI registration and run live ring-buffer capture (requires root)
+sudo python3 examples/python/21_zero_copy_ring.py lo
+```
+
 ---
 
 ## Build Your Own Experiment
@@ -339,7 +371,10 @@ You now know that:
 5. TLS encryption can be entirely bypassed if the endpoint's memory is compromised.
 6. The Link Layer determines exactly how to slice the first bytes of a packet.
 7. Application layers (like HTTP and DNS) can be natively parsed into zero-copy structures for high-performance extraction.
+8. Multiple packet sources can capture concurrently in parallel threads, and fan-in packets to a single thread.
+9. Linux `PACKET_MMAP` ring-buffers enable zero-copy capture directly from raw sockets.
 
 Go into `examples/python/00_quickstart.py` and modify the code. Try to write a script that only prints packets where `pkt["caplen"] > 1000` (finding large data transfers), or write a script that counts how many times your computer uses `udp` versus `tcp`. 
 
 You are now interacting directly with the pulse of the Internet.
+

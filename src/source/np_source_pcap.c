@@ -81,6 +81,14 @@ static void pcap_src_close(np_source_t *src)
     if (p->handle) { pcap_close(p->handle); p->handle = NULL; }
 }
 
+static void pcap_src_stop(np_source_t *src)
+{
+    pcap_priv_t *p = src->priv;
+    if (p && p->handle) {
+        pcap_breakloop(p->handle);
+    }
+}
+
 static void pcap_src_free(np_source_t *src)
 {
     pcap_src_close(src);
@@ -91,6 +99,7 @@ static void pcap_src_free(np_source_t *src)
 static const struct np_source_ops live_ops = {
     .open  = live_open,
     .next  = common_next,
+    .stop  = pcap_src_stop,
     .close = pcap_src_close,
     .free  = pcap_src_free,
 };
@@ -98,6 +107,7 @@ static const struct np_source_ops live_ops = {
 static const struct np_source_ops file_ops = {
     .open  = live_open,   /* same — handle already open */
     .next  = common_next,
+    .stop  = pcap_src_stop,
     .close = pcap_src_close,
     .free  = pcap_src_free,
 };

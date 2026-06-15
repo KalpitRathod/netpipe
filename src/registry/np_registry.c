@@ -100,10 +100,11 @@ const np_sink_desc_t *np_registry_find_sink_by_ext(const char *ext)
         char buf[128];
         strncpy(buf, d->extensions, sizeof(buf) - 1);
         buf[sizeof(buf) - 1] = '\0';
-        char *tok = strtok(buf, ",");
+        char *saveptr = NULL;
+        char *tok = strtok_r(buf, ",", &saveptr);
         while (tok) {
             if (strcasecmp(tok, ext) == 0) return d;
-            tok = strtok(NULL, ",");
+            tok = strtok_r(NULL, ",", &saveptr);
         }
     }
     return NULL;
