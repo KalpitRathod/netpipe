@@ -120,10 +120,10 @@ static np_err_t decode_eth(np_packet_t *pkt,
 
     uint16_t et = ntohs(eth->ethertype);
 
-    /* skip 802.1Q vlan tags */
+    /* skip 802.1Q / 802.1AD (QinQ) vlan tags — loop for double-tagged frames */
     const uint8_t *payload = data + sizeof(eth_hdr_t);
     size_t         paylen  = len  - sizeof(eth_hdr_t);
-    if (et == 0x8100 && paylen >= 4) {
+    while ((et == 0x8100 || et == 0x88a8) && paylen >= 4) {
         uint16_t v;
         memcpy(&v, payload + 2, sizeof(v));
         et      = ntohs(v);
