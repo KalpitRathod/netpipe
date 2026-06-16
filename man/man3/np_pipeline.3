@@ -1,0 +1,70 @@
+.TH NP_PIPELINE 3 "June 2026" "netpipe v0.1.0" "Library Functions Manual"
+.SH NAME
+np_pipeline_new, np_pipeline_free, np_pipeline_run, np_pipeline_stop \- netpipe pipeline lifecycle management
+.SH SYNOPSIS
+.B #include <netpipe.h>
+.PP
+.BI "np_pipeline_t *np_pipeline_new(void);"
+.br
+.BI "void np_pipeline_free(np_pipeline_t *" pl ");"
+.br
+.BI "np_err_t np_pipeline_run(np_pipeline_t *" pl ");"
+.br
+.BI "void np_pipeline_stop(np_pipeline_t *" pl ");"
+.SH DESCRIPTION
+These functions manage the lifecycle and execution of a netpipe pipeline context.
+.PP
+The
+.BR np_pipeline_new ()
+function allocates and initializes a new, empty pipeline context.
+It returns a pointer to the allocated
+.B np_pipeline_t
+struct, or
+.B NULL
+if an error occurs (such as memory exhaustion).
+.PP
+The
+.BR np_pipeline_free ()
+function stops the pipeline if it is running, releases all resources associated with the pipeline context, and frees the context itself.
+Any sources, filters, processors, and sinks added to the pipeline are automatically freed when the pipeline is freed; the caller must not free them individually.
+If
+.I pl
+is
+.BR NULL ,
+no action is taken.
+.PP
+The
+.BR np_pipeline_run ()
+function starts processing network packets.
+It runs the main event loop, reading packets from all configured sources, passing them through filters and processors, and sending them to sinks.
+By default, this call is blocking and does not return until the pipeline is stopped using
+.BR np_pipeline_stop ()
+or an unrecoverable error occurs.
+.PP
+The
+.BR np_pipeline_stop ()
+function requests the running pipeline to shut down.
+It signals the pipeline's event loop to terminate, which will cause
+.BR np_pipeline_run ()
+to complete its current packet processing and return.
+This function is thread-safe and can be safely called from a signal handler (e.g., to handle SIGINT/Ctrl-C) or from another thread.
+.SH RETURN VALUES
+.BR np_pipeline_new ()
+returns a pointer to the newly allocated pipeline context, or
+.B NULL
+on failure.
+.PP
+.BR np_pipeline_run ()
+returns
+.B NP_OK
+on clean shutdown, or an error code of type
+.B np_err_t
+on failure (see
+.BR libnetpipe (3)
+for details).
+.SH SEE ALSO
+.BR libnetpipe (3),
+.BR np_source (3),
+.BR np_filter (3),
+.BR np_processor (3),
+.BR np_sink (3)

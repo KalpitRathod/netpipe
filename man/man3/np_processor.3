@@ -1,0 +1,97 @@
+.TH NP_PROCESSOR 3 "June 2026" "netpipe v0.1.0" "Library Functions Manual"
+.SH NAME
+np_processor_fn, np_processor_tcp_stream, np_processor_rate_limit, np_processor_payload_transform, np_processor_flow_tracker, np_processor_lua, np_pipeline_add_processor \- netpipe packet processors
+.SH SYNOPSIS
+.B #include <netpipe.h>
+.PP
+.BI "typedef np_err_t (*np_proc_fn)(np_packet_t *" pkt ", void *" userdata ");"
+.PP
+.BI "np_processor_t *np_processor_fn(np_proc_fn " fn ", void *" userdata ");"
+.br
+.BI "np_processor_t *np_processor_tcp_stream(void);"
+.br
+.BI "np_processor_t *np_processor_rate_limit(uint64_t " bytes_per_sec ");"
+.br
+.BI "np_processor_t *np_processor_payload_transform(const char *" mode ", const char *" pattern ", const char *" replacement ");"
+.br
+.BI "np_processor_t *np_processor_flow_tracker(void);"
+.br
+.BI "np_processor_t *np_processor_lua(const char *" script_path ");"
+.br
+.BI "np_err_t np_pipeline_add_processor(np_pipeline_t *" pl ", np_processor_t *" proc ");"
+.SH DESCRIPTION
+These functions create and attach packet processors or transforms to a pipeline.
+Processors inspect, modify, rate-limit, or track packets as they flow through the pipeline.
+.PP
+The
+.BR np_processor_fn ()
+function creates a custom callback-based processor.
+Whenever a packet passes through this stage, the user-defined callback function
+.I fn
+is executed with a pointer to the packet and the user-supplied
+.IR userdata .
+The callback must return
+.B NP_OK
+to allow the packet to proceed, or a negative
+.B np_err_t
+to filter out the packet or indicate a pipeline error.
+.PP
+The
+.BR np_processor_tcp_stream ()
+function creates a TCP stream reassembly processor.
+It tracks TCP handshakes and sequence numbers to reconstruct application-layer payloads.
+Reassembled payload bytes are attached to the packet structure as a contiguous stream, enabling deep packet inspection of application protocols (like HTTP and TLS).
+.PP
+The
+.BR np_processor_rate_limit ()
+function creates a Token Bucket rate limiter that throttles the pipeline's throughput to the specified
+.I bytes_per_sec .
+It delays packet delivery by calculating the elapsed high-resolution CPU time and sleeping the pipeline worker thread when the bucket is empty.
+.PP
+The
+.BR np_processor_payload_transform ()
+function creates a payload replacer/transformer.
+It searches for a specific byte or string
+.I pattern
+in the packet payload and replaces it with
+.I replacement .
+The parameter
+.I mode
+can define regex or literal substitution modes.
+.PP
+The
+.BR np_processor_flow_tracker ()
+function creates a flow tracking processor.
+It maps packets to bi-directional conversations (flows) based on the five-tuple (source/destination IP, source/destination port, protocol) and assigns unique flow IDs.
+.PP
+The
+.BR np_processor_lua ()
+function loads and executes an external Lua script specified by
+.I script_path
+for every packet.
+This allows writing dynamic packet manipulation or analysis logic in Lua.
+.PP
+The
+.BR np_pipeline_add_processor ()
+function attaches a processor to the pipeline.
+Processors are executed sequentially in the order they are added.
+Processors added to a pipeline are owned by the pipeline and automatically freed when
+.BR np_pipeline_free ()
+is called.
+.SH RETURN VALUES
+Processor creation functions return a pointer to a newly allocated
+.B np_processor_t
+on success, or
+.B NULL
+on failure.
+.PP
+.BR np_pipeline_add_processor ()
+returns
+.B NP_OK
+on success, or a negative
+.B np_err_t
+code on failure.
+.SH SEE ALSO
+.BR libnetpipe (3),
+.BR np_pipeline (3),
+.BR np_packet (3)

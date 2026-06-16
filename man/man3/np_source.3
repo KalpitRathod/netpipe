@@ -1,0 +1,80 @@
+.TH NP_SOURCE 3 "June 2026" "netpipe v0.1.0" "Library Functions Manual"
+.SH NAME
+np_source_live, np_source_file, np_source_ring, np_source_free, np_pipeline_add_source \- netpipe packet ingestion sources
+.SH SYNOPSIS
+.B #include <netpipe.h>
+.PP
+.BI "np_source_t *np_source_live(const char *" device ", int " snaplen ", int " promisc ", int " timeout_ms ");"
+.br
+.BI "np_source_t *np_source_file(const char *" path ");"
+.br
+.BI "np_source_t *np_source_ring(const char *" device ");"
+.br
+.BI "void np_source_free(np_source_t *" src ");"
+.br
+.BI "np_err_t np_pipeline_add_source(np_pipeline_t *" pl ", np_source_t *" src ");"
+.SH DESCRIPTION
+These functions create, manage, and attach packet capture and ingestion sources to a pipeline.
+.PP
+The
+.BR np_source_live ()
+function creates a source that captures live traffic from a physical or virtual network interface.
+.I device
+is the name of the network interface (e.g., "eth0", "wlo1", "any").
+.I snaplen
+specifies the maximum number of bytes to capture per packet.
+.I promisc
+is a boolean flag that, when non-zero, enables promiscuous mode on the interface.
+.I timeout_ms
+sets the read timeout for packet capture in milliseconds.
+This source requires the application to run with administrative privileges (e.g., as root or with the
+.B CAP_NET_RAW
+capability).
+.PP
+The
+.BR np_source_file ()
+function creates an offline source that reads packets from a standard Wireshark-compatible PCAP or PCAP-NG file specified by
+.IR path .
+It does not require root privileges.
+.PP
+The
+.BR np_source_ring ()
+function creates a high-performance live capture source using Linux zero-copy circular ring buffers via the
+.B PACKET_MMAP
+option on raw sockets
+.RB ( AF_PACKET ).
+This allows capturing high packet-per-second rates with minimal CPU usage.
+It requires administrative privileges.
+.PP
+The
+.BR np_source_free ()
+function releases resources allocated for the specified source.
+Note that sources added to a pipeline via
+.BR np_pipeline_add_source ()
+are automatically owned by the pipeline and will be freed when
+.BR np_pipeline_free ()
+is called; the caller must not call
+.BR np_source_free ()
+on them.
+.PP
+The
+.BR np_pipeline_add_source ()
+function attaches an ingestion source to a pipeline.
+When the pipeline is run, it will capture/read packets from this source and inject them into the processing queue.
+A single pipeline can have multiple sources attached, which will run concurrently in separate background threads.
+.SH RETURN VALUES
+The creation functions return a pointer to a newly allocated
+.B np_source_t
+on success, or
+.B NULL
+on failure.
+.PP
+.BR np_pipeline_add_source ()
+returns
+.B NP_OK
+on success, or a negative
+.B np_err_t
+code on failure.
+.SH SEE ALSO
+.BR libnetpipe (3),
+.BR np_pipeline (3)

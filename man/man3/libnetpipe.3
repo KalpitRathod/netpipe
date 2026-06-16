@@ -1,0 +1,129 @@
+.TH LIBNETPIPE 3 "June 2026" "netpipe v0.1.0" "Library Functions Manual"
+.SH NAME
+libnetpipe \- high-performance network stream-processing library
+.SH SYNOPSIS
+.B #include <netpipe.h>
+.PP
+.BI "np_err_t np_init(void);"
+.br
+.BI "void np_cleanup(void);"
+.br
+.BI "const char *np_strerror(np_err_t " err ");"
+.SH DESCRIPTION
+.B libnetpipe
+is a C11 library for high-performance, pipeline-driven network packet processing. It allows building complex capture, filtering, processing, and routing applications.
+.PP
+The execution model is based on a pipeline
+.RB ( np_pipeline_t )
+that feeds packets
+.RB ( np_packet_t )
+from one or more sources through optional filters and processors into one or more sinks.
+.PP
+Before calling any other library functions, the library must be initialized by calling
+.BR np_init ().
+When the application is done using the library, resources should be cleaned up by calling
+.BR np_cleanup ().
+.SH RETURN VALUES
+Most functions in
+.B libnetpipe
+return a status code of type
+.BR np_err_t .
+The following error codes are defined:
+.TP
+.B NP_OK
+Success (0).
+.TP
+.B NP_ERR_GENERIC
+Generic/unspecified error (\-1).
+.TP
+.B NP_ERR_NOMEM
+Out of memory (\-2).
+.TP
+.B NP_ERR_IO
+Input/output error (\-3).
+.TP
+.B NP_ERR_PROTO
+Protocol parsing or validation error (\-4).
+.TP
+.B NP_ERR_FILTER
+Invalid filter expression or execution error (\-5).
+.TP
+.B NP_ERR_TIMEOUT
+Operation timed out (\-6).
+.TP
+.B NP_ERR_NODEV
+Device or file not found (\-7).
+.TP
+.B NP_ERR_PERM
+Permission denied (\-8).
+.TP
+.B NP_ERR_EOF
+End of file reached (\-9).
+.PP
+The function
+.BR np_strerror ()
+converts an
+.B np_err_t
+error code into a human-readable English string.
+.SH EXAMPLE
+The following is a minimal example that captures traffic from interface "eth0", filters for HTTP (port 80), and dumps it as a PCAP file:
+.PP
+.nf
+#include <netpipe.h>
+#include <stdio.h>
+
+int main(void) {
+    /* Initialize the library */
+    if (np_init() != NP_OK) {
+        fprintf(stderr, "Failed to initialize netpipe\\n");
+        return 1;
+    }
+
+    /* Create a new pipeline context */
+    np_pipeline_t *pl = np_pipeline_new();
+    if (!pl) {
+        fprintf(stderr, "Failed to create pipeline\\n");
+        np_cleanup();
+        return 1;
+    }
+
+    /* Add a live packet source */
+    np_source_t *src = np_source_live("eth0", 65535, 1, 1000);
+    np_pipeline_add_source(pl, src);
+
+    /* Filter for port 80 */
+    np_filter_t *flt = np_filter_port(80);
+    np_pipeline_add_filter(pl, flt);
+
+    /* Write filtered packets to a pcap file */
+    np_sink_t *snk = np_sink_pcap("http_traffic.pcap");
+    np_pipeline_add_sink(pl, snk);
+
+    /* Run the pipeline (blocks until stopped or interrupted) */
+    printf("Running netpipe pipeline... Press Ctrl-C to stop.\\n");
+    np_err_t err = np_pipeline_run(pl);
+    if (err != NP_OK) {
+        fprintf(stderr, "Pipeline error: %s\\n", np_strerror(err));
+    }
+
+    /* Clean up resources */
+    np_pipeline_free(pl);
+    np_cleanup();
+    return 0;
+}
+.fi
+.SH COMPILING
+To compile applications using
+.BR libnetpipe ,
+link against the static library and its dependencies:
+.PP
+.RS
+.B gcc myapp.c -I/usr/local/include -L/usr/local/lib -lnetpipe -lpcap -lpthread -ldl -lm -o myapp
+.RE
+.SH SEE ALSO
+.BR np_pipeline (3),
+.BR np_source (3),
+.BR np_filter (3),
+.BR np_processor (3),
+.BR np_sink (3),
+.BR np_packet (3)

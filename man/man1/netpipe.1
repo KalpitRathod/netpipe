@@ -1,0 +1,119 @@
+.TH NETPIPE 1 "June 2026" "netpipe v0.1.0" "User Commands"
+.SH NAME
+netpipe \- modular network traffic stream-processing engine
+.SH SYNOPSIS
+.B netpipe
+[
+.I OPTIONS
+]
+.SH DESCRIPTION
+.B netpipe
+is a high-performance command-line network packet processing tool that operates as a composable, modular stream processor. It captures packets from network interfaces or reads them from files, applies filters and processors, and routes them to one or more output sinks.
+.SH OPTIONS
+.SS Input Options
+.TP
+.BI \-i " device"
+Perform live capture on the specified network interface (e.g., eth0, wlo1, any).
+Requires root privileges or the CAP_NET_RAW capability.
+.TP
+.BI \-r " file.pcap"
+Read packets from the specified PCAP file. Does not require root privileges.
+.TP
+.B \-D
+List all available capture devices and exit.
+.TP
+.BI \-s " snaplen"
+Set the maximum bytes captured per packet. Default is 65535 (full packet).
+.TP
+.B \-p
+Disable promiscuous mode. By default, live captures put the network card into promiscuous mode.
+.TP
+.BI \-T " ms"
+Set the read timeout for live captures in milliseconds. Default is 1000 ms.
+.SS Filtering Options
+Multiple filters are logically ANDed.
+.TP
+.BI \-f " bpf-expr"
+Specify a Berkeley Packet Filter (BPF) expression (e.g., "tcp port 443", "icmp").
+.TP
+.BI \-proto " name"
+Match packets containing the named protocol in their layer stack. Supported names:
+.I eth, arp, ip, ip6, icmp, tcp, udp, dns, http, tls.
+.TP
+.BI \-port " number"
+Match packets whose source or destination port equals
+.IR number .
+.TP
+.BI \-host " ip"
+Match packets whose source or destination IPv4 address equals
+.IR ip .
+.SS Output Options
+.TP
+.BI \-o " file"
+Write packet data to
+.IR file .
+If the output format is not specified with
+.B \-fmt\fR,
+the format is inferred from the file extension (.pcap, .json, .hex, .stats). Use "-" or omit to write to standard output.
+.TP
+.BI \-fmt " format"
+Force the output format. Overrides extension inference. Supported formats:
+.RS
+.IP "pcap" 8
+Wireshark-compatible binary PCAP.
+.IP "json" 8
+Newline-delimited JSON (NDJSON), one object per packet.
+.IP "hex" 8
+Human-readable annotated hex dump with layer boundaries.
+.IP "stats" 8
+Periodic summary of counters.
+.IP "null" 8
+Discard packets (useful with rate-limiters or stats).
+.RE
+.TP
+.BI \-stats " file"
+Write a periodic statistics report to
+.I file
+(use "-" for stdout) every 5 seconds.
+.TP
+.BI \-c " count"
+Terminate the pipeline after processing
+.I count
+packets.
+.SS Logging Options
+.TP
+.B \-v
+Enable verbose debug logs.
+.TP
+.B \-vv
+Enable extremely verbose trace logs (very noisy).
+.TP
+.B \-q
+Quiet mode. Only warnings and errors are logged.
+.TP
+.B \-no-color
+Disable ANSI color escape sequences in logs.
+.SS Miscellaneous Options
+.TP
+.B \-h, \-\-help
+Print help information and exit.
+.TP
+.B \-\-version
+Print version information and exit.
+.SH RECIPES
+.TP
+Live capture to PCAP:
+.B sudo netpipe \-i eth0 \-o capture.pcap
+.TP
+Watch HTTP traffic in hex dump:
+.B sudo netpipe \-i wlo1 \-f "tcp port 80" \-fmt hex
+.TP
+Extract DNS logs as JSON:
+.B sudo netpipe \-i eth0 \-proto dns \-fmt json
+.TP
+Analyze PCAP file offline:
+.B netpipe \-r capture.pcap \-host 1.2.3.4 \-fmt hex | less
+.SH SEE ALSO
+.BR libnetpipe (3)
+.SH AUTHORS
+Written by the netpipe contributors.

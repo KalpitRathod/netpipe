@@ -1,0 +1,109 @@
+.TH NP_SINK 3 "June 2026" "netpipe v0.1.0" "Library Functions Manual"
+.SH NAME
+np_sink_pcap, np_sink_pcapng, np_sink_json, np_sink_hex, np_sink_stats, np_sink_null, np_sink_pretty, np_sink_tuntap, np_sink_socket, np_sink_free, np_pipeline_add_sink \- netpipe packet output sinks
+.SH SYNOPSIS
+.B #include <netpipe.h>
+.PP
+.BI "np_sink_t *np_sink_pcap(const char *" path ");"
+.br
+.BI "np_sink_t *np_sink_pcapng(const char *" path ");"
+.br
+.BI "np_sink_t *np_sink_json(const char *" path ");"
+.br
+.BI "np_sink_t *np_sink_hex(const char *" path ");"
+.br
+.BI "np_sink_t *np_sink_stats(const char *" path ");"
+.br
+.BI "np_sink_t *np_sink_null(void);"
+.br
+.BI "np_sink_t *np_sink_pretty(const char *" path ");"
+.br
+.BI "np_sink_t *np_sink_tuntap(const char *" uri ");"
+.br
+.BI "np_sink_t *np_sink_socket(const char *" uri ");"
+.br
+.BI "void np_sink_free(np_sink_t *" s ");"
+.br
+.BI "np_err_t np_pipeline_add_sink(np_pipeline_t *" pl ", np_sink_t *" s ");"
+.SH DESCRIPTION
+These functions create, manage, and attach output sinks to a pipeline.
+Sinks write, format, or transmit processed packets.
+A single pipeline can have multiple sinks, causing packets to be duplicated to all outputs.
+.PP
+The
+.BR np_sink_pcap ()
+function creates a binary PCAP sink that writes packets in the standard libpcap format to the file at
+.IR path .
+The output file is compatible with Wireshark and tcpdump.
+.PP
+The
+.BR np_sink_pcapng ()
+function creates a PCAP-NG sink, allowing metadata such as interface descriptions and name resolution blocks to be saved.
+.PP
+The
+.BR np_sink_json ()
+function creates a JSON formatter sink. It writes one JSON object per line (NDJSON) containing packet summaries and decoded layers to the file or stream specified by
+.IR path .
+.PP
+The
+.BR np_sink_hex ()
+function creates an annotated hex dump sink that writes human-readable representations with protocol layer markers to
+.IR path .
+.PP
+The
+.BR np_sink_stats ()
+function creates a statistics logger that periodically (every 5 seconds) dumps packet counters and protocol distributions to
+.IR path .
+.PP
+The
+.BR np_sink_null ()
+function creates a null sink that discards all packet data. It is useful for benchmarking or when using rate-limiters/processors without requiring local output.
+.PP
+The
+.BR np_sink_pretty ()
+function creates a tshark-style text logging sink.
+.PP
+The
+.BR np_sink_tuntap ()
+function creates a virtual network interface injector sink.
+The parameter
+.I uri
+should specify the tap device (e.g., "tun://tun0" or "tap://tap0"). Packets written to this sink are injected directly into the Linux kernel routing table.
+Requires administrative privileges.
+.PP
+The
+.BR np_sink_socket ()
+function creates a network forwarding sink.
+The parameter
+.I uri
+should specify the target address (e.g., "socket://192.168.1.100:9999").
+It opens a connection (TCP/UDP) and streams raw packets preceded by standard PCAP file headers.
+.PP
+The
+.BR np_sink_free ()
+function releases the resources allocated for the specified sink.
+Sinks added to a pipeline via
+.BR np_pipeline_add_sink ()
+are automatically managed by the pipeline and will be freed when
+.BR np_pipeline_free ()
+is called; the caller must not free them.
+.PP
+The
+.BR np_pipeline_add_sink ()
+function attaches an output sink to the pipeline.
+.SH RETURN VALUES
+Sink creation functions return a pointer to a newly allocated
+.B np_sink_t
+on success, or
+.B NULL
+on failure.
+.PP
+.BR np_pipeline_add_sink ()
+returns
+.B NP_OK
+on success, or a negative
+.B np_err_t
+code on failure.
+.SH SEE ALSO
+.BR libnetpipe (3),
+.BR np_pipeline (3)

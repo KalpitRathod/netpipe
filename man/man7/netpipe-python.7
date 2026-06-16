@@ -1,0 +1,149 @@
+.TH NETPIPE-PYTHON 7 "June 2026" "netpipe v0.1.0" "Miscellaneous"
+.SH NAME
+netpipe-python \- interfacing netpipe with Python using JSON streams
+.SH DESCRIPTION
+The
+.B netpipe
+utility provides an elegant, zero-dependency interface for Python applications.
+Instead of loading heavy, complex binary bindings (e.g. ctypes or C extensions), Python scripts can execute
+.B netpipe
+as a subprocess with the
+.B \-fmt json
+option.
+.PP
+In this mode,
+.B netpipe
+emits one JSON-formatted packet per line (Newline-Delimited JSON / NDJSON) to its standard output.
+The Python application reads this stream line-by-line using standard subprocess and JSON libraries.
+.SH JSON SCHEMA
+Each line written by
+.B netpipe \-fmt json
+is a single JSON object representing a captured packet.
+.SS Standard Fields
+All packet objects contain the following top-level keys:
+.TP
+.B seq
+(integer) A 1-indexed global packet capture sequence number.
+.TP
+.B ts
+(string) The packet arrival timestamp formatted as `HH:MM:SS.microseconds` (e.g., "14:20:05.123456").
+.TP
+.B caplen
+(integer) The number of bytes captured.
+.TP
+.B wirelen
+(integer) The original packet size as seen on the physical wire.
+.TP
+.B flow_id
+(integer) A unique 32-bit hash signature computed from the packet's 5-tuple (source IP, destination IP, source port, destination port, and protocol).
+Packets belonging to the same bidirectional conversation share this ID.
+.TP
+.B layers
+(array of objects) The stack of network layers parsed from the packet. Each object contains:
+.RS
+.IP "proto" 8
+(string) The protocol identifier. Supported protocol strings include:
+.I "ethernet", "arp", "ipv4", "ipv6", "icmp", "tcp", "udp", "dns", "http", "tls".
+.IP "len" 8
+(integer) The size of this layer's header + payload in bytes.
+.RE
+.TP
+.B raw_hex
+(string) A hexadecimal representation of the raw captured frame bytes.
+.SS Decoded DNS Fields
+If the packet contains DNS traffic (UDP/TCP port 53) and was parsed successfully, a top-level
+.B dns
+dictionary is present:
+.TP
+.B is_response
+(boolean)
+.B false
+if the packet is a query;
+.B true
+if it is a response.
+.TP
+.B query
+(object, present in queries) Contains:
+.RS
+.IP "name" 8
+(string) The queried domain name (e.g. "example.com").
+.IP "type" 8
+(integer) The DNS query type number (e.g. 1 for A, 28 for AAAA, 5 for CNAME).
+.RE
+.TP
+.B answers
+(array of objects, present in responses) Each answer record contains:
+.RS
+.IP "name" 8
+(string) The domain name.
+.IP "data" 8
+(string) The resolved value (e.g., an IPv4 address, IPv6 address, or CNAME target).
+.RE
+.SS Decoded HTTP Fields
+If the packet contains HTTP/1.1 traffic (port 80 or heuristic matches) and was parsed successfully, a top-level
+.B http
+dictionary is present:
+.TP
+.B method
+(string, request only) The HTTP request method (e.g. "GET", "POST").
+.TP
+.B path
+(string, request only) The requested resource URI path (e.g. "/index.html").
+.TP
+.B status
+(integer, response only) The HTTP response status code (e.g. 200, 404).
+.TP
+.B phrase
+(string, response only) The HTTP response status phrase (e.g. "OK", "Not Found").
+.TP
+.B headers
+(object) A dictionary of key-value pairs representing the HTTP headers.
+.SS Reassembled Stream Fields
+If the TCP stream reassembly processor is enabled (via
+.B \-proc tcp-stream\fR),
+the packet may contain:
+.TP
+.B stream_hex
+(string) A hexadecimal representation of the cumulative reassembled TCP stream bytes for the packet's flow up to this point.
+.SH PYTHON RECIPES
+The following script template demonstrates how to launch
+.B netpipe
+as a subprocess and parse packets in real time:
+.PP
+.nf
+import subprocess
+import json
+import sys
+
+# Define netpipe command line
+cmd = ["netpipe", "-i", "eth0", "-fmt", "json", "-q"]
+
+# Launch subprocess
+proc = subprocess.Popen(
+    cmd,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL,
+    text=True
+)
+
+try:
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        
+        # Parse packet dictionary
+        pkt = json.loads(line)
+        
+        # Check for HTTP request
+        http = pkt.get("http")
+        if http and "method" in http:
+            print(f"[{pkt['ts']}] {http['method']} {http['path']}")
+            
+except KeyboardInterrupt:
+    proc.terminate()
+    print("\\nStopped.")
+.fi
+.SH SEE ALSO
+.BR netpipe (1),
+.BR libnetpipe (3)

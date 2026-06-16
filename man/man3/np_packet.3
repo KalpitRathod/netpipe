@@ -1,0 +1,188 @@
+.TH NP_PACKET 3 "June 2026" "netpipe v0.1.0" "Library Functions Manual"
+.SH NAME
+np_packet_alloc, np_packet_free, np_packet_clone, np_packet_t, np_layer_t, np_proto_t, np_http_msg_t, np_dns_msg_t \- netpipe packet structures and lifecycle
+.SH SYNOPSIS
+.B #include <netpipe.h>
+.PP
+.BI "np_packet_t *np_packet_alloc(size_t " caplen ");"
+.br
+.BI "void np_packet_free(np_packet_t *" pkt ");"
+.br
+.BI "np_packet_t *np_packet_clone(const np_packet_t *" src ");"
+.SH DESCRIPTION
+These functions and structures represent and manage individual network packets in the netpipe library.
+.SS Packet Lifecycle
+.PP
+The
+.BR np_packet_alloc ()
+function allocates a new packet structure with space for raw captured packet bytes up to
+.I caplen
+size.
+It returns a pointer to the newly allocated packet or
+.B NULL
+on failure.
+.PP
+The
+.BR np_packet_free ()
+function releases all memory associated with the packet, including internal scratch space and reassembled stream data.
+.PP
+The
+.BR np_packet_clone ()
+function creates a complete deep copy of the packet
+.IR src .
+It returns a pointer to the cloned packet or
+.B NULL
+on failure.
+.SS Structures
+.PP
+A packet is represented by the
+.B np_packet_t
+structure:
+.PP
+.nf
+typedef struct np_packet {
+    struct timespec  ts;            /* Capture timestamp */
+    uint32_t         caplen;        /* Captured length */
+    uint32_t         wirelen;       /* Length on the wire */
+    uint8_t         *raw;           /* Raw captured frame bytes */
+    int              nlayers;       /* Count of active layers */
+    np_layer_t       layers[8];     /* Layer list */
+    
+    /* Convenience pointers to layers (NULL if layer not present) */
+    const np_layer_t *eth;          /* Ethernet / Link layer */
+    const np_layer_t *net;          /* IPv4 / IPv6 / ARP */
+    const np_layer_t *transport;    /* TCP / UDP / ICMP */
+    const np_layer_t *app;          /* HTTP / DNS / TLS */
+
+    uint64_t         seq;           /* Capture sequence number */
+    uint32_t         flow_id;       /* Flow hash signature */
+    uint8_t         *stream_data;   /* TCP stream reassembled payload */
+    size_t           stream_len;    /* Reassembled stream length */
+} np_packet_t;
+.fi
+.PP
+Each protocol layer inside the packet is described by
+.B np_layer_t\fR:
+.PP
+.nf
+typedef struct np_layer {
+    np_proto_t    proto;      /* Protocol identifier */
+    const uint8_t *data;      /* Pointer to starting byte in raw frame */
+    size_t        len;       /* Length of this layer's header + payload */
+    void         *decoded;   /* Points to decoded structures (if any) */
+} np_layer_t;
+.fi
+.PP
+The protocol identifier
+.B np_proto_t
+is an enum representing protocols parsed by the demuxer:
+.TP
+.B NP_PROTO_RAW
+Raw IP frame (no Link layer).
+.TP
+.B NP_PROTO_ETH
+Ethernet (Layer 2).
+.TP
+.B NP_PROTO_ARP
+Address Resolution Protocol.
+.TP
+.B NP_PROTO_IP4
+IPv4 (Layer 3).
+.TP
+.B NP_PROTO_IP6
+IPv6 (Layer 3).
+.TP
+.B NP_PROTO_ICMP
+ICMP or ICMPv6 (Layer 4).
+.TP
+.B NP_PROTO_TCP
+TCP (Layer 4).
+.TP
+.B NP_PROTO_UDP
+UDP (Layer 4).
+.TP
+.B NP_PROTO_DNS
+Domain Name System (Layer 7).
+The layer's
+.I decoded
+pointer points to a
+.B np_dns_msg_t
+structure.
+.TP
+.B NP_PROTO_HTTP
+Hypertext Transfer Protocol (Layer 7).
+The layer's
+.I decoded
+pointer points to a
+.B np_http_msg_t
+structure.
+.TP
+.B NP_PROTO_TLS
+Transport Layer Security (Layer 7).
+.SS Decoded Protocol Objects
+For protocols with high-level parsing enabled (DNS, HTTP), the demuxer populates structures in packet-scoped scratch memory.
+These are zero-copy structures, meaning strings do not allocate heap memory but point directly back to offsets in the packet's raw frame or scratch space.
+.PP
+A zero-copy string is represented by the
+.B np_str_t
+structure:
+.PP
+.nf
+typedef struct {
+    const char *str;
+    size_t      len;
+} np_str_t;
+.fi
+.PP
+The decoded HTTP message is represented by the
+.B np_http_msg_t
+structure:
+.PP
+.nf
+typedef struct {
+    bool is_request;                /* Request vs Response */
+    
+    /* Request specific fields */
+    np_str_t method;                /* GET, POST, etc. */
+    np_str_t path;                  /* Request URI */
+    np_str_t version;               /* HTTP version string */
+    
+    /* Response specific fields */
+    int      status_code;           /* HTTP status code (e.g. 200) */
+    np_str_t status_phrase;         /* "OK", "Not Found", etc. */
+    
+    int              num_headers;
+    np_http_header_t headers[32];   /* Name-value header list */
+    
+    const uint8_t   *body;          /* Message body pointer */
+    size_t           body_len;      /* Length of message body */
+} np_http_msg_t;
+.fi
+.PP
+The decoded DNS message is represented by the
+.B np_dns_msg_t
+structure:
+.PP
+.nf
+typedef struct {
+    uint16_t id;                    /* DNS query ID */
+    bool     is_response;           /* Query vs Response */
+    int      rcode;                 /* Response status (e.g. NXDOMAIN) */
+    
+    char     query_name[256];       /* Queried domain name */
+    uint16_t query_type;            /* Query type (A, AAAA, CNAME) */
+    
+    int             num_answers;
+    np_dns_answer_t answers[8];     /* Answer records list */
+} np_dns_msg_t;
+.fi
+.SH RETURN VALUES
+.BR np_packet_alloc ()
+and
+.BR np_packet_clone ()
+return a pointer to the allocated packet on success, or
+.B NULL
+on failure.
+.SH SEE ALSO
+.BR libnetpipe (3),
+.BR np_pipeline (3)

@@ -1,0 +1,59 @@
+# Build and library artifacts
+build/
+*.o
+*.d
+*.a
+
+# Local Lua build directory
+lua-5.4.7/install/
+lua-5.4.7/**/*.o
+lua-5.4.7/**/*.a
+lua-5.4.7/src/lua
+lua-5.4.7/src/luac
+
+# Captured packets and logs
+*.pcap
+*.pcapng
+*.cap
+*.json
+*.ndjson
+*.jsonl
+*.hex
+*.log
+
+# Python cache and environment
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# System files
+.DS_Store
+.vscode/
+.idea/
+
+# Packaging outputs
+description-pak
+doc-pak/
+*.tar.gz
+*.deb
+
+# Local Lua binaries and dependencies (copied/built locally)
+bin/lua
+bin/luac
+include/lauxlib.h
+include/lua.h
+include/lua.hpp
+include/luaconf.h
+include/lualib.h
+man/man1/lua.1
+man/man1/luac.1
+
+# Allow test fixtures
+!tests/fixtures/*.pcap
+
+# Fuzzing outputs
+fuzz-out/
+
