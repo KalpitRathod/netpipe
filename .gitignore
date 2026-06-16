@@ -57,3 +57,4 @@ man/man1/luac.1
 # Fuzzing outputs
 fuzz-out/
 
+.github/
