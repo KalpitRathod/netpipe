@@ -1,0 +1,174 @@
+.TH LIBNETPIPE 3 "June 2026" "netpipe v0.1.0" "Library Functions Manual"
+.SH NAME
+libnetpipe \- high-performance network stream-processing library
+.SH SYNOPSIS
+.B #include <netpipe.h>
+.PP
+.BI "np_err_t    np_init(void);"
+.br
+.BI "void        np_cleanup(void);"
+.br
+.BI "const char *np_strerror(np_err_t " err ");"
+.br
+.BI "void        np_version(int *" major ", int *" minor ", int *" patch ");"
+.SH DESCRIPTION
+.B libnetpipe
+is a C11 library for high-performance, pipeline-driven network packet processing.
+It provides building blocks for capture, filtering, processing, and routing of
+network traffic in a composable, modular style.
+.PP
+The execution model is based on a pipeline
+.RB ( np_pipeline_t )
+that feeds packets
+.RB ( np_packet_t )
+from one or more sources through optional filters and processors into one or
+more sinks.
+.PP
+Before calling any other library function,
+.BR np_init ()
+must be called.
+After the application is finished,
+.BR np_cleanup ()
+should be called to release global resources.
+.SS Stable API
+.PP
+All functions and types in
+.B <netpipe.h>
+that are
+.I not
+annotated with
+.B NP_EXPERIMENTAL
+are stable: their names, signatures, and semantics will not change without a
+bump of
+.BR NETPIPE_VERSION_MAJOR .
+.SS Experimental API
+.PP
+Symbols annotated with
+.B NP_EXPERIMENTAL
+are functional but may change in any release without a major version bump.
+This includes
+.BR np_sink_tuntap (),
+.BR np_sink_socket (),
+and
+.BR np_processor_tls_decrypt ().
+Do not use them in production code without accepting that risk.
+.SS Version Query
+.PP
+.BR np_version ()
+writes the version of the linked library into
+.IR *major ,
+.IR *minor ,
+and
+.IR *patch .
+Any of the pointers may be
+.BR NULL .
+Use this — rather than the
+.B NETPIPE_VERSION_*
+preprocessor macros — when the library may have been updated independently
+of the application's compile-time headers.
+.PP
+The
+.B NETPIPE_MAKE_VERSION(maj,min,patch)
+macro packs three small integers into a single
+.B uint32_t
+that can be used in compile-time comparisons:
+.PP
+.nf
+#if NETPIPE_VERSION_INT >= NETPIPE_MAKE_VERSION(0, 2, 0)
+    /* use new API added in 0.2.0 */
+#endif
+.fi
+.SH RETURN VALUES
+Most functions in
+.B libnetpipe
+return a status code of type
+.BR np_err_t .
+The following codes are defined:
+.TP
+.B NP_OK
+Success (0).
+.TP
+.B NP_ERR_GENERIC
+Unspecified error (\-1).
+.TP
+.B NP_ERR_NOMEM
+Out of memory (\-2).
+.TP
+.B NP_ERR_IO
+Input/output error (\-3).
+.TP
+.B NP_ERR_PROTO
+Protocol parsing or validation error (\-4).
+.TP
+.B NP_ERR_FILTER
+Invalid filter expression or execution error (\-5).
+.TP
+.B NP_ERR_TIMEOUT
+Operation timed out (\-6).
+.TP
+.B NP_ERR_NODEV
+Device or file not found (\-7).
+.TP
+.B NP_ERR_PERM
+Permission denied; try running with
+.B CAP_NET_RAW
+or as root (\-8).
+.TP
+.B NP_ERR_EOF
+End of input reached (normal for file sources) (\-9).
+.PP
+.BR np_strerror ()
+converts any
+.B np_err_t
+code to a read-only English string.
+.SH EXAMPLE
+The following minimal program captures HTTP traffic, dumps it to a PCAP file,
+and handles Ctrl-C:
+.PP
+.nf
+#include <netpipe.h>
+#include <stdio.h>
+#include <signal.h>
+
+static np_pipeline_t *g_pl;
+static void on_sigint(int s) { (void)s; np_pipeline_stop(g_pl); }
+
+int main(void) {
+    if (np_init() != NP_OK) {
+        fprintf(stderr, "np_init failed\\n");
+        return 1;
+    }
+
+    g_pl = np_pipeline_new();
+    if (!g_pl) { np_cleanup(); return 1; }
+
+    np_pipeline_add_source(g_pl, np_source_live("eth0", 65535, 1, 1000));
+    np_pipeline_add_filter(g_pl, np_filter_port(80));
+    np_pipeline_add_sink(g_pl, np_sink_pcap("http_traffic.pcap"));
+
+    signal(SIGINT, on_sigint);
+    printf("Capturing HTTP on eth0 — Ctrl-C to stop.\\n");
+
+    np_err_t err = np_pipeline_run(g_pl);
+    if (err != NP_OK)
+        fprintf(stderr, "pipeline error: %s\\n", np_strerror(err));
+
+    np_pipeline_free(g_pl);
+    np_cleanup();
+    return 0;
+}
+.fi
+.SH COMPILING
+.PP
+.RS
+.B gcc myapp.c -I/usr/local/include -L/usr/local/lib -lnetpipe -lpcap -lpthread -ldl -lm -o myapp
+.RE
+.SH SEE ALSO
+.BR np_pipeline (3),
+.BR np_source (3),
+.BR np_filter (3),
+.BR np_processor (3),
+.BR np_sink (3),
+.BR np_packet (3),
+.BR netpipe (1),
+.BR netpipe-python (7)

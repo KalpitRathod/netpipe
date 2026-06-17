@@ -1,0 +1,202 @@
+.TH NP_PROCESSOR 3 "June 2026" "netpipe v0.1.0" "Library Functions Manual"
+.SH NAME
+np_processor_fn, np_processor_tcp_stream, np_processor_rate_limit, np_processor_payload_transform, np_processor_flow_tracker, np_processor_lua, np_processor_tls_decrypt, np_pipeline_add_processor \- netpipe packet processors
+.SH SYNOPSIS
+.B #include <netpipe.h>
+.PP
+.BI "typedef np_err_t (*np_proc_fn)(np_packet_t *" pkt ", void *" userdata ");"
+.PP
+.BI "np_processor_t *np_processor_fn(np_proc_fn " fn ", void *" userdata ");"
+.br
+.BI "np_processor_t *np_processor_tcp_stream(void);"
+.br
+.BI "np_processor_t *np_processor_rate_limit(uint64_t " bytes_per_sec ");"
+.br
+.BI "np_processor_t *np_processor_payload_transform(const char *" mode ", const char *" pattern ", const char *" replacement ");"
+.br
+.BI "np_processor_t *np_processor_flow_tracker(void);"
+.br
+.BI "np_processor_t *np_processor_lua(const char *" script_path ");"
+.br
+.BI "NP_EXPERIMENTAL np_processor_t *np_processor_tls_decrypt(const char *" keylog_path ");"
+.br
+.BI "np_err_t np_pipeline_add_processor(np_pipeline_t *" pl ", np_processor_t *" proc ");"
+.SH DESCRIPTION
+These functions create and attach packet processors or transforms to a pipeline.
+Processors inspect, modify, rate-limit, decrypt, or track packets as they flow through the pipeline.
+.PP
+The
+.BR np_processor_fn ()
+function creates a custom callback-based processor.
+Whenever a packet passes through this stage, the user-defined callback function
+.I fn
+is executed with a pointer to the packet and the user-supplied
+.IR userdata .
+The callback must return
+.B NP_OK
+to allow the packet to proceed, or a negative
+.B np_err_t
+to filter out the packet or indicate a pipeline error.
+.PP
+The
+.BR np_processor_tcp_stream ()
+function creates a TCP stream reassembly processor.
+It tracks TCP handshakes and sequence numbers to reconstruct application-layer
+payloads.
+The reassembler implements:
+.RS 4
+.IP \(bu 3
+Per-flow, per-direction reassembly contexts keyed on the 4-tuple.
+.IP \(bu 3
+Sorted segment queue with overlap clipping for retransmissions.
+.IP \(bu 3
+Hole-timeout flushing (1 second default) for gap recovery.
+.IP \(bu 3
+SYN/FIN/RST state machine with re-SYN detection (connection reuse).
+.IP \(bu 3
+RFC 793 sequence arithmetic (correct across 2^32 wrap-around).
+.RE
+.PP
+Reassembled payload bytes are attached to the packet as
+.I pkt->stream_data
+(of length
+.IR pkt->stream_len ),
+enabling deep packet inspection of application protocols (like HTTP and TLS).
+.PP
+The
+.BR np_processor_rate_limit ()
+function creates a Token Bucket rate limiter that throttles the pipeline's
+throughput to the specified
+.IR bytes_per_sec .
+It uses
+.BR nanosleep (2)
+for high-resolution timing and handles oversized packets gracefully
+(packets larger than the rate cap are passed through with a warning).
+.PP
+The
+.BR np_processor_payload_transform ()
+function creates a payload replacer/transformer.
+It searches for a specific byte or string
+.I pattern
+in the packet payload and replaces it with
+.IR replacement .
+The parameter
+.I mode
+can define regex or literal substitution modes.
+.PP
+The
+.BR np_processor_flow_tracker ()
+function creates a flow tracking processor.
+It maps packets to bi-directional conversations (flows) based on the five-tuple
+(source/destination IP, source/destination port, protocol) and assigns unique
+flow IDs.
+Includes automatic garbage collection of idle flows (60 second timeout,
+sweep every 1024 packets).
+.PP
+The
+.BR np_processor_lua ()
+function loads and executes an external Lua script specified by
+.I script_path
+for every packet.
+The script registers callbacks via
+.BR NP_REGISTER_PROCESSOR() :
+an
+.I init()
+function (called once at startup), a
+.I process(pkt)
+function (called per packet \(em return
+.B false
+to drop the packet), and a
+.I free()
+function (called at shutdown).
+This allows writing dynamic packet manipulation or analysis logic in Lua.
+.PP
+The
+.BR np_processor_tls_decrypt ()
+function
+.RB ( NP_EXPERIMENTAL )
+creates a TLS session decryption processor.
+It loads an NSS key-log file
+.RI ( SSLKEYLOGFILE
+format) from
+.I keylog_path
+and decrypts TLS 1.2 and TLS 1.3 traffic inline.
+.PP
+Supported cipher suites:
+.RS 4
+.IP \(bu 3
+TLS 1.3:
+.IR TLS_AES_128_GCM_SHA256 ,
+.IR TLS_AES_256_GCM_SHA384 ,
+.IR TLS_CHACHA20_POLY1305_SHA256
+.IP \(bu 3
+TLS 1.2 (GCM/ChaCha20):
+.IR ECDHE_RSA_WITH_AES_128_GCM_SHA256 ,
+.IR ECDHE_RSA_WITH_AES_256_GCM_SHA384 ,
+.IR ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 ,
+.IR ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 ,
+.IR RSA_WITH_AES_128_GCM_SHA256 ,
+.IR RSA_WITH_AES_256_GCM_SHA384 ,
+.IR ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 ,
+.IR ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+.RE
+.PP
+Supported key-log record types:
+.IR CLIENT_RANDOM ,
+.IR CLIENT_HANDSHAKE_TRAFFIC_SECRET ,
+.IR SERVER_HANDSHAKE_TRAFFIC_SECRET ,
+.IR CLIENT_TRAFFIC_SECRET_0 ,
+.IR SERVER_TRAFFIC_SECRET_0 .
+.PP
+Decrypted plaintext is placed in
+.I pkt->stream_data
+and the TLS layer's
+.I data
+pointer is redirected to the plaintext, so downstream processors that walk
+.I pkt->layers[]
+see the decrypted bytes.
+.PP
+The
+.BR np_pipeline_add_processor ()
+function attaches a processor to the pipeline.
+Processors are executed sequentially in the order they are added.
+Processors added to a pipeline are owned by the pipeline and automatically freed when
+.BR np_pipeline_free ()
+is called.
+.SH RETURN VALUES
+Processor creation functions return a pointer to a newly allocated
+.B np_processor_t
+on success, or
+.B NULL
+on failure.
+.PP
+.BR np_pipeline_add_processor ()
+returns
+.B NP_OK
+on success, or a negative
+.B np_err_t
+code on failure.
+.SH EXAMPLES
+.SS TCP stream reassembly
+.nf
+np_pipeline_t *pl = np_pipeline_new();
+np_pipeline_add_processor(pl, np_processor_tcp_stream());
+np_pipeline_add_source(pl, np_source_file("capture.pcap"));
+np_pipeline_add_sink(pl, np_sink_json(stdout));
+np_pipeline_run(pl);
+np_pipeline_free(pl);
+.fi
+.SS TLS decryption
+.nf
+np_pipeline_t *pl = np_pipeline_new();
+np_pipeline_add_processor(pl, np_processor_tls_decrypt("/tmp/keys.log"));
+np_pipeline_add_source(pl, np_source_file("tls_capture.pcap"));
+np_pipeline_add_sink(pl, np_sink_json(stdout));
+np_pipeline_run(pl);
+np_pipeline_free(pl);
+.fi
+.SH SEE ALSO
+.BR libnetpipe (3),
+.BR np_pipeline (3),
+.BR np_packet (3),
+.BR netpipe (1)

@@ -1,0 +1,41 @@
+#!/bin/sh
+# postinst — runs after the package is unpacked
+#
+# Netpipe is a normal user-space binary; no special setup is needed beyond
+# confirming the bundled Lua scripts are readable. We deliberately do NOT
+# grant CAP_NET_RAW automatically — that is a sysadmin decision.
+
+set -e
+
+case "$1" in
+    configure)
+        # Make the bundled Lua scripts world-readable (they are examples).
+        if [ -d /usr/share/netpipe/lua ]; then
+            chmod 0755 /usr/share/netpipe/lua
+            chmod 0644 /usr/share/netpipe/lua/*.lua 2>/dev/null || true
+        fi
+
+        # Hint at the manual page if mandb is available.
+        if command -v mandb >/dev/null 2>&1; then
+            mandb -q /usr/share/man/man1/netpipe.1 2>/dev/null || true
+        fi
+
+        echo "netpipe 0.1.0 installed."
+        echo "  • Try:        netpipe --version"
+        echo "  • Quickstart: netpipe -r capture.pcap -fmt pretty"
+        echo "  • Live:       sudo netpipe -i eth0 -f 'tcp port 80'"
+        echo "  • Lua IDS:    netpipe -i eth0 -proc lua:/usr/share/netpipe/lua/mitigate.lua"
+    ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        :
+    ;;
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+    ;;
+esac
+
+# dh_installdeb will replace this with shell code automatically
+# created when no Debhelper directive is in use.
+
+exit 0

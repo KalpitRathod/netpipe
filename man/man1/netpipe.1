@@ -1,0 +1,384 @@
+.TH NETPIPE 1 "June 2026" "netpipe v0.1.0" "User Commands"
+.SH NAME
+netpipe \- modular network traffic stream-processing engine
+.SH SYNOPSIS
+.B netpipe
+[
+.I OPTIONS
+]
+.SH DESCRIPTION
+.B netpipe
+is a high-performance command-line network packet processing tool that operates as a
+composable, modular stream processor.
+It captures packets from network interfaces or reads them from files,
+applies filters and processors, and routes them to one or more output sinks.
+.PP
+Key capabilities include TCP stream reassembly (out-of-order, retransmission,
+gap-fill), TLS 1.2/1.3 session decryption via NSS key-log files, inline Lua
+scripting for custom packet processing, and a token-bucket rate limiter.
+.SH OPTIONS
+.SS Input Options
+.TP
+.BI \-i " device"
+Perform live capture on the specified network interface (e.g., eth0, wlo1, any).
+Requires root privileges or the
+.B CAP_NET_RAW
+capability.
+.TP
+.BI \-r " file.pcap"
+Read packets from the specified PCAP or PCAP-NG file.
+Does not require root privileges.
+.TP
+.B \-D
+List all available capture devices and exit.
+.TP
+.BI \-s " snaplen"
+Set the maximum bytes captured per packet.
+Default is 65535 (full packet).
+.TP
+.B \-p
+Disable promiscuous mode.
+By default, live captures put the network card into promiscuous mode.
+.TP
+.BI \-T " ms"
+Set the read timeout for live captures in milliseconds.
+Default is 1000 ms.
+.TP
+.B \-\-ring
+Use a high-performance zero-copy
+.B AF_PACKET + PACKET_MMAP
+ring-buffer source instead of libpcap (Linux only).
+Requires an interface specified with
+.BR \-i .
+Requires root or
+.BR CAP_NET_RAW .
+.SS Filtering Options
+Multiple filters are logically ANDed.
+.TP
+.BI \-f " bpf-expr"
+Specify a Berkeley Packet Filter (BPF) expression
+(e.g.,
+.IR "tcp port 443" ,
+.IR icmp ).
+.TP
+.BI \-proto " name"
+Match packets containing the named protocol in their layer stack.
+Supported names:
+.IR eth ,
+.IR arp ,
+.IR ip ,
+.IR ip6 ,
+.IR icmp ,
+.IR tcp ,
+.IR udp ,
+.IR dns ,
+.IR http ,
+.IR tls ,
+.IR quic ,
+.IR dhcp ,
+.IR sip ,
+.IR mqtt ,
+.IR vxlan .
+.TP
+.BI \-port " number"
+Match packets whose source or destination port equals
+.IR number .
+.TP
+.BI \-host " ip"
+Match packets whose source or destination IPv4 address equals
+.IR ip .
+.SS Processing Options
+.TP
+.BI \-proc " spec"
+Attach a built-in processor.
+.I spec
+is one of:
+.RS
+.IP "tcp-stream" 14
+Reassemble TCP byte-streams with out-of-order segment buffering,
+retransmission detection, hole-timeout gap flushing, and SYN/FIN/RST
+state machine.
+Populates the
+.B stream_data
+/
+.B stream_len
+fields on each packet.
+.IP "flow-tracker" 14
+Associate packets with bidirectional flows by five-tuple hash.
+Includes automatic GC of idle flows (60s timeout).
+.IP "rate-limit:\fIN\fP" 14
+Token-bucket rate limiter; allow at most
+.I N
+bytes per second through the pipeline.
+Uses
+.BR nanosleep (2)
+for high-resolution timing.
+.IP "transform:\fImode\fP:\fIpattern\fP:\fIreplacement\fP" 14
+Search-and-replace payload bytes.
+.I mode
+is
+.B literal
+or
+.BR regex .
+.IP "lua:\fIscript.lua\fP" 14
+Execute the Lua script for every packet.
+The script can register
+.BR init (),
+.BR process (pkt),
+and
+.BR free ()
+callbacks.
+Returning
+.B false
+from
+.B process()
+drops the packet from the pipeline.
+.IP "tls-decrypt:\fIkeylog.txt\fP" 14
+Decrypt TLS 1.2 and TLS 1.3 traffic inline using an NSS key-log file
+.RB ( SSLKEYLOGFILE
+format).
+Supports AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305 cipher suites.
+Decrypted plaintext is placed in
+.B stream_data
+and the TLS layer's
+.B data
+pointer is redirected to the plaintext.
+.RE
+.TP
+.BI \-rate " bps"
+Rate-limit output to
+.I bps
+bytes per second (shorthand for
+.BR \-proc " rate-limit:\fIbps\fP" ).
+.SS Output Options
+.TP
+.BI \-o " file"
+Write packet data to
+.IR file .
+If the output format is not specified with
+.BR \-fmt ,
+the format is inferred from the file extension
+(.pcap, .pcapng, .json, .hex, .stats).
+Use \- to write to standard output.
+Special schemes:
+.RS
+.IP "tap://\fIdev\fP" 18
+Inject packets into a Linux TAP (Layer 2) virtual interface.
+Requires root or
+.BR CAP_NET_ADMIN .
+.IP "tun://\fIdev\fP" 18
+Inject packets into a Linux TUN (Layer 3) virtual interface.
+Requires root or
+.BR CAP_NET_ADMIN .
+.IP "socket://\fIhost:port\fP" 18
+Forward raw PCAP stream to a remote host over TCP.
+.RE
+.TP
+.BI \-fmt " format"
+Force the output format, overriding extension inference.
+Supported formats:
+.RS
+.IP "pcap" 10
+Wireshark-compatible binary PCAP (libpcap format).
+.IP "pcapng" 10
+PCAP-NG with interface-description and metadata blocks.
+.IP "json" 10
+Newline-delimited JSON (NDJSON), one object per packet.
+See
+.BR netpipe-python (7)
+for the JSON schema.
+.IP "hex" 10
+Human-readable annotated hex dump with layer boundaries.
+.IP "stats" 10
+Periodic summary of packet and byte counters (every 5 seconds).
+.IP "pretty" 10
+tshark-style single-line packet summaries.
+.IP "null" 10
+Discard packets (useful with processors or
+.BR \-stats ).
+.RE
+.TP
+.BI \-stats " file"
+Write a periodic statistics report to
+.I file
+(use \- for stdout) every 5 seconds independently of the main output sink.
+.TP
+.BI \-c " count"
+Terminate the pipeline after processing
+.I count
+packets.
+.SS Logging Options
+.TP
+.B \-v
+Enable verbose (DEBUG-level) logs.
+.TP
+.B \-vv
+Enable trace-level logs (very noisy; useful for debugging the demuxer).
+.TP
+.B \-q
+Quiet mode; only warnings and errors are logged.
+.TP
+.B \-no-color
+Disable ANSI color escape sequences in log output.
+.SS Miscellaneous Options
+.TP
+.B \-h, \-\-help
+Print help information and exit.
+.TP
+.B \-\-version
+Print version information and exit.
+.SH TLS DECRYPTION
+.B netpipe
+can decrypt TLS 1.2 and TLS 1.3 traffic inline if an NSS key-log file
+.RB ( SSLKEYLOGFILE
+format) is provided.
+The key-log file is emitted by Chrome, Firefox, curl, OpenSSL, and other
+TLS implementations when the
+.B SSLKEYLOGFILE
+environment variable is set.
+.PP
+Supported cipher suites:
+.RS 4
+.IP \(bu 3
+TLS 1.3:
+.IR TLS_AES_128_GCM_SHA256 ,
+.IR TLS_AES_256_GCM_SHA384 ,
+.IR TLS_CHACHA20_POLY1305_SHA256
+.IP \(bu 3
+TLS 1.2 (GCM/ChaCha20):
+.IR ECDHE_RSA_WITH_AES_128_GCM_SHA256 ,
+.IR ECDHE_RSA_WITH_AES_256_GCM_SHA384 ,
+.IR ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 ,
+.IR ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 ,
+.IR RSA_WITH_AES_128_GCM_SHA256 ,
+.IR RSA_WITH_AES_256_GCM_SHA384 ,
+.IR ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 ,
+.IR ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+.RE
+.PP
+Supported key-log record types:
+.IR CLIENT_RANDOM ,
+.IR CLIENT_HANDSHAKE_TRAFFIC_SECRET ,
+.IR SERVER_HANDSHAKE_TRAFFIC_SECRET ,
+.IR CLIENT_TRAFFIC_SECRET_0 ,
+.IR SERVER_TRAFFIC_SECRET_0 .
+.PP
+Example:
+.PP
+.nf
+.RS
+SSLKEYLOGFILE=/tmp/keys.log curl https://example.com &
+netpipe \-i eth0 \-f "tcp port 443" \\
+        \-proc tls\-decrypt:/tmp/keys.log \\
+        \-fmt json
+.RE
+.fi
+.SH LUA SCRIPTING
+Lua scripts register a processor via
+.BR NP_REGISTER_PROCESSOR(\fItable\fP) .
+The table may contain:
+.RS 4
+.IP \(bu 3
+.BR init() \(em called once when the processor is created.
+.IP \(bu 3
+.BR process( pkt ) \(em called for every packet.
+Return
+.B true
+to keep, or
+.B false
+to drop the packet from downstream sinks.
+.IP \(bu 3
+.BR free() \(em called once when the processor is freed.
+.RE
+.PP
+The
+.I pkt
+table exposes fields like
+.IR proto ,
+.IR src_ip ,
+.IR dst_ip ,
+.IR src_port ,
+.IR dst_port ,
+.IR dns_query_name ,
+.IR raw_hex ,
+and
+.IR stream_hex .
+.PP
+A production-ready DNS IDS script (
+.BR mitigate.lua )
+is bundled and can be used as:
+.PP
+.nf
+.RS
+netpipe \-i eth0 \-proc lua:mitigate.lua \-fmt json
+.RE
+.fi
+.SH RECIPES
+.TP
+Live capture to PCAP:
+.B sudo netpipe \-i eth0 \-o capture.pcap
+.TP
+Watch HTTP traffic as annotated hex:
+.B "sudo netpipe \-i wlo1 \-f \"tcp port 80\" \-fmt hex"
+.TP
+Readable one-line summaries with
+.BR pretty :
+.B "sudo netpipe \-i wlo1 \-proto dns \-fmt pretty"
+.TP
+Extract DNS traffic as JSON (pipe to jq):
+.B "sudo netpipe \-i eth0 \-proto dns \-fmt json | jq ."
+.TP
+Analyse a PCAP file offline:
+.B "netpipe \-r capture.pcap \-host 1.2.3.4 \-fmt hex | less"
+.TP
+Capture 100 packets then stop:
+.B sudo netpipe \-i wlo1 \-c 100 \-o top100.pcap
+.TP
+Live stats to stdout while capturing to file:
+.B "sudo netpipe \-i eth0 \-o session.pcap \-stats \-"
+.TP
+TCP stream reassembly with JSON output:
+.B "sudo netpipe \-i wlo1 \-proto http \-proc tcp-stream \-fmt json"
+.TP
+Zero-copy ring-buffer capture:
+.B "sudo netpipe \-i eth0 \-\-ring \-o capture.pcap"
+.TP
+TLS decryption:
+.B "sudo netpipe \-i eth0 \-f \"tcp port 443\" \-proc tls-decrypt:/tmp/keys.log \-fmt json"
+.TP
+Lua IDS (DNS exfil detection):
+.B "sudo netpipe \-i eth0 \-proc lua:mitigate.lua \-fmt null"
+.TP
+Forward packets to a remote collector:
+.B "sudo netpipe \-i eth0 \-c 50 \-o socket://192.168.1.10:9999"
+.TP
+Inject packets into a TAP interface:
+.B "sudo netpipe \-r cap.pcap \-o tap://tap0 \-rate 10000"
+.SH EXIT STATUS
+.TP
+.B 0
+Pipeline completed normally (including Ctrl-C / SIGINT).
+.TP
+.B 1
+A configuration or runtime error occurred; details logged to stderr.
+.SH FILES
+.TP
+.I /usr/share/netpipe/lua/mitigate.lua
+Bundled DNS IDS Lua script.
+.TP
+.I /usr/share/netpipe/lua/test.lua
+Bundled DNS exfil-payload isolation harness (for testing).
+.SH SEE ALSO
+.BR libnetpipe (3),
+.BR np_pipeline (3),
+.BR np_source (3),
+.BR np_filter (3),
+.BR np_processor (3),
+.BR np_sink (3),
+.BR np_packet (3),
+.BR netpipe-python (7),
+.BR tcpdump (1),
+.BR tshark (1),
+.BR openssl (1)
+.SH AUTHORS
+Written by the netpipe contributors.

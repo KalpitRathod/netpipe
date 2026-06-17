@@ -1,0 +1,25 @@
+#!/bin/sh
+# prerm — runs before the package is removed
+#
+# Nothing to clean up at the system level: netpipe does not create
+# persistent state, systemd units, or sockets.  User-written Lua
+# scripts under /usr/share/netpipe/lua/ belong to the package and will
+# be removed by dpkg automatically.
+
+set -e
+
+case "$1" in
+    remove|upgrade|deconfigure)
+        # No-op — netpipe is stateless.
+        :
+    ;;
+    failed-upgrade)
+        :
+    ;;
+    *)
+        echo "prerm called with unknown argument \`$1'" >&2
+        exit 1
+    ;;
+esac
+
+exit 0

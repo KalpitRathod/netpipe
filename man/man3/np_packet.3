@@ -1,0 +1,290 @@
+.TH NP_PACKET 3 "June 2026" "netpipe v0.1.0" "Library Functions Manual"
+.SH NAME
+np_packet_alloc, np_packet_free, np_packet_clone, np_packet_ts_str,
+np_packet_t, np_layer_t, np_proto_t, np_http_msg_t, np_dns_msg_t,
+np_str_t, np_linktype_t
+\- netpipe packet structures and lifecycle
+.SH SYNOPSIS
+.B #include <netpipe.h>
+.PP
+.BI "np_packet_t *np_packet_alloc(size_t " caplen ");"
+.br
+.BI "void         np_packet_free(np_packet_t *" pkt ");"
+.br
+.BI "np_packet_t *np_packet_clone(const np_packet_t *" src ");"
+.br
+.BI "void         np_packet_ts_str(const np_packet_t *" pkt ", char *" buf ", size_t " bufsz ");"
+.SH DESCRIPTION
+These functions and structures represent and manage individual network packets
+in the netpipe library.
+.SS Packet Lifecycle
+.PP
+The
+.BR np_packet_alloc ()
+function allocates a new packet structure with space for raw captured packet
+bytes of up to
+.I caplen
+bytes.
+It returns a pointer to the newly allocated packet or
+.B NULL
+on failure.
+.PP
+The
+.BR np_packet_free ()
+function releases all memory associated with the packet, including any
+dynamically allocated
+.B stream_data
+buffer.
+Passing
+.B NULL
+is safe.
+.PP
+The
+.BR np_packet_clone ()
+function creates a complete deep copy of
+.IR src ,
+including
+.BR raw ,
+.BR layers[] ,
+.BR stream_data ,
+and the scratch region.
+Returns
+.B NULL
+on failure.
+.PP
+The
+.BR np_packet_ts_str ()
+function formats the packet's capture timestamp into
+.IR buf
+as the string
+.BR "HH:MM:SS.uuuuuu" .
+.I bufsz
+must be at least 16; 32 is recommended to be safe.
+.SS Structures
+.PP
+A packet is represented by the
+.B np_packet_t
+structure:
+.PP
+.nf
+typedef struct np_packet {
+    struct timespec  ts;          /* capture timestamp         */
+    uint32_t         caplen;      /* bytes captured            */
+    uint32_t         wirelen;     /* bytes on the wire         */
+    uint8_t         *raw;         /* raw frame buffer          */
+
+    int              nlayers;
+    np_layer_t       layers[8];   /* decoded layer stack       */
+
+    const np_layer_t *eth;        /* link layer (or NULL)      */
+    const np_layer_t *net;        /* network layer (or NULL)   */
+    const np_layer_t *transport;  /* transport layer (or NULL) */
+    const np_layer_t *app;        /* app layer (or NULL)       */
+
+    uint64_t         seq;         /* capture sequence number   */
+    uint32_t         flow_id;     /* 5-tuple flow hash         */
+
+    uint8_t         *stream_data; /* reassembled TCP payload   */
+    size_t           stream_len;
+
+    void            *user_data;   /* caller-owned context      */
+
+    /* internal — do not access directly */
+    uint8_t          scratch[8192];
+    size_t           scratch_used;
+
+    void            *reserved[4]; /* must be NULL              */
+} np_packet_t;
+.fi
+.PP
+Each protocol layer is described by
+.BR np_layer_t :
+.PP
+.nf
+typedef struct np_layer {
+    np_proto_t     proto;   /* protocol identifier                    */
+    const uint8_t *data;    /* pointer into raw[] — not copied        */
+    size_t         len;     /* bytes in this layer (hdr + payload)    */
+    void          *decoded; /* points into scratch (or NULL)          */
+} np_layer_t;
+.fi
+.PP
+The
+.B decoded
+pointer, when non-NULL, points to a protocol-specific structure in
+the packet's scratch region (see
+.B Decoded Protocol Objects
+below).
+It is valid only for the lifetime of the
+.B np_packet_t
+it belongs to.
+.SS Protocol Identifiers
+.PP
+.B np_proto_t
+is the enum of protocols that the built-in demuxer can decode:
+.TP
+.B NP_PROTO_RAW
+Raw IP frame (no link header).
+.TP
+.B NP_PROTO_ETH
+Ethernet (IEEE 802.3).
+.TP
+.B NP_PROTO_ARP
+Address Resolution Protocol.
+.TP
+.B NP_PROTO_IP4
+Internet Protocol version 4.
+.TP
+.B NP_PROTO_IP6
+Internet Protocol version 6.
+.TP
+.B NP_PROTO_ICMP
+ICMP or ICMPv6.
+.TP
+.B NP_PROTO_TCP
+Transmission Control Protocol.
+.TP
+.B NP_PROTO_UDP
+User Datagram Protocol.
+.TP
+.B NP_PROTO_DNS
+Domain Name System (application layer).
+The layer's
+.B decoded
+pointer, if non-NULL, points to an
+.B np_dns_msg_t
+structure.
+.TP
+.B NP_PROTO_HTTP
+HTTP/1.x (application layer).
+The layer's
+.B decoded
+pointer, if non-NULL, points to an
+.B np_http_msg_t
+structure.
+.TP
+.B NP_PROTO_TLS
+TLS/SSL (application layer).
+No structured decode is currently performed; the raw bytes are accessible
+via the layer's
+.B data
+and
+.B len
+fields.
+.SS Zero-Copy String (np_str_t)
+.PP
+String fields inside decoded protocol structures use
+.BR np_str_t ,
+a non-owning slice that points directly into the packet's raw buffer:
+.PP
+.nf
+typedef struct {
+    const char *str;  /* NOT NUL-terminated */
+    size_t      len;
+} np_str_t;
+.fi
+.PP
+Always use
+.B len
+to bound reads.
+Do not rely on a NUL terminator.
+The pointer is valid only for the lifetime of the enclosing
+.BR np_packet_t .
+.SS Decoded Protocol Objects
+.PP
+The decoded HTTP message is represented by
+.BR np_http_msg_t .
+Access it via
+.B pkt->app->decoded
+when
+.B pkt->app->proto == NP_PROTO_HTTP
+and
+.B pkt->app->decoded != NULL\fR:
+.PP
+.nf
+typedef struct {
+    bool     is_request;      /* true=request, false=response  */
+
+    np_str_t method;          /* "GET", "POST", etc.           */
+    np_str_t path;            /* request URI                   */
+    np_str_t version;         /* "HTTP/1.1"                    */
+
+    int      status_code;     /* response: 200, 404, …         */
+    np_str_t status_phrase;   /* response: "OK", "Not Found"   */
+
+    int              num_headers;
+    np_http_header_t headers[32];
+
+    const uint8_t   *body;
+    size_t           body_len;
+} np_http_msg_t;
+.fi
+.PP
+The decoded DNS message is represented by
+.BR np_dns_msg_t .
+Access it via
+.B pkt->app->decoded
+when
+.B pkt->app->proto == NP_PROTO_DNS
+and
+.B pkt->app->decoded != NULL\fR:
+.PP
+.nf
+typedef struct {
+    uint16_t id;              /* transaction ID               */
+    bool     is_response;     /* true=response, false=query   */
+    int      rcode;           /* 0=NOERROR, 3=NXDOMAIN, …    */
+
+    char     query_name[256]; /* queried domain (NUL-term.)   */
+    uint16_t query_type;      /* A=1, AAAA=28, CNAME=5, …     */
+
+    int             num_answers;
+    np_dns_answer_t answers[8];
+} np_dns_msg_t;
+.fi
+.PP
+Each
+.B np_dns_answer_t
+contains:
+.PP
+.nf
+typedef struct {
+    char     name[256];      /* owner name (NUL-terminated)  */
+    uint16_t type;           /* record type                  */
+    uint16_t class_;         /* class (1=IN)                 */
+    uint32_t ttl;            /* time-to-live in seconds      */
+    uint16_t data_len;       /* wire length of RDATA         */
+    char     rdata_str[256]; /* human-readable RDATA         */
+} np_dns_answer_t;
+.fi
+.SS User Data
+.PP
+The
+.B user_data
+field of
+.B np_packet_t
+is never read or written by the library.
+Callers may use it freely to attach per-packet context.
+It is shallow-copied by
+.BR np_packet_clone ().
+.SH RETURN VALUES
+.BR np_packet_alloc ()
+and
+.BR np_packet_clone ()
+return a pointer to the allocated packet on success, or
+.B NULL
+on failure (memory exhaustion).
+.SH NOTES
+The
+.B scratch[]
+region and
+.B scratch_used
+counter are managed internally by the demuxer.
+Do not read or write them directly; they are exposed in the struct only to
+avoid a second heap allocation per packet.
+The layout of
+.B scratch[]
+is not part of the stable ABI.
+.SH SEE ALSO
+.BR libnetpipe (3),
+.BR np_pipeline (3)

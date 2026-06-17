@@ -1,0 +1,173 @@
+.TH NP_SINK 3 "June 2026" "netpipe v0.1.0" "Library Functions Manual"
+.SH NAME
+np_sink_pcap, np_sink_pcapng, np_sink_json, np_sink_hex, np_sink_stats,
+np_sink_null, np_sink_pretty, np_sink_tuntap, np_sink_socket,
+np_sink_free, np_pipeline_add_sink \- netpipe packet output sinks
+.SH SYNOPSIS
+.B #include <netpipe.h>
+.PP
+.BI "np_sink_t *np_sink_pcap(const char *"   path ");"
+.br
+.BI "np_sink_t *np_sink_pcapng(const char *" path ");"
+.br
+.BI "np_sink_t *np_sink_json(const char *"   path ");"
+.br
+.BI "np_sink_t *np_sink_hex(const char *"    path ");"
+.br
+.BI "np_sink_t *np_sink_stats(const char *"  path ");"
+.br
+.BI "np_sink_t *np_sink_null(void);"
+.br
+.BI "np_sink_t *np_sink_pretty(const char *" path ");"
+.br
+.BI "NP_EXPERIMENTAL np_sink_t *np_sink_tuntap(const char *"  uri ");"
+.br
+.BI "NP_EXPERIMENTAL np_sink_t *np_sink_socket(const char *"  uri ");"
+.br
+.BI "void       np_sink_free(np_sink_t *"    s ");"
+.br
+.BI "np_err_t   np_pipeline_add_sink(np_pipeline_t *" pl ", np_sink_t *" s ");"
+.SH DESCRIPTION
+These functions create and attach output sinks to a pipeline.
+Sinks write, format, or transmit processed packets.
+A single pipeline can have multiple sinks simultaneously; each packet is
+delivered to all sinks in the order they were added.
+.PP
+For the
+.IR path
+argument, use
+.B \-
+to write to standard output; pass
+.B /dev/null
+or
+.B NULL
+to discard.
+.SS Stable sinks
+.PP
+The following sinks are part of the stable API and will not be removed or
+have their signatures altered without a
+.B NETPIPE_VERSION_MAJOR
+bump.
+.PP
+The
+.BR np_sink_pcap ()
+function creates a binary PCAP sink that writes packets in the standard
+libpcap format to the file at
+.IR path .
+The output is compatible with Wireshark and tcpdump.
+.PP
+The
+.BR np_sink_pcapng ()
+function creates a PCAP-NG sink, recording interface-description and
+name-resolution blocks in addition to packet data.
+.PP
+The
+.BR np_sink_json ()
+function creates a JSON formatter sink.
+It writes one JSON object per line (NDJSON) containing packet summaries,
+decoded layers, and protocol data to
+.IR path .
+See
+.BR netpipe-python (7)
+for the full JSON schema.
+.PP
+The
+.BR np_sink_hex ()
+function creates an annotated hex-dump sink that writes human-readable
+representations with protocol layer markers to
+.IR path .
+.PP
+The
+.BR np_sink_stats ()
+function creates a statistics logger that periodically (every 5 seconds)
+dumps packet counters and protocol distributions to
+.IR path .
+A final summary is written when the pipeline stops.
+.PP
+The
+.BR np_sink_null ()
+function creates a null sink that discards all packet data.
+It is useful for benchmarking processors, or when using the
+.B \-stats
+option to collect statistics without storing packets.
+.PP
+The
+.BR np_sink_pretty ()
+function creates a tshark-style single-line summary sink that prints
+one formatted text line per packet to
+.IR path .
+.SS Experimental sinks
+.PP
+The following sinks are marked
+.B NP_EXPERIMENTAL
+because their URI formats and exact behaviour may change in future releases
+without a major-version bump.
+.PP
+The
+.BR np_sink_tuntap ()
+function creates a virtual-network-interface injector sink.
+The parameter
+.I uri
+selects the target device:
+.BR "tun://tun0"
+for a TUN (Layer-3) device or
+.BR "tap://tap0"
+for a TAP (Layer-2) device.
+Packets written to this sink are injected directly into the Linux
+kernel routing subsystem.
+Requires
+.B CAP_NET_ADMIN
+or root.
+.PP
+The
+.BR np_sink_socket ()
+function creates a network-forwarding sink.
+The parameter
+.I uri
+specifies the destination:
+.BR "socket://192.168.1.100:9999" .
+The sink opens a TCP connection and streams raw packets preceded by
+standard PCAP global and record headers so that Wireshark or netpipe can
+consume the remote stream directly.
+.SS Ownership
+.PP
+The
+.BR np_sink_free ()
+function releases resources for a sink that was
+.I not
+added to a pipeline.
+Sinks successfully passed to
+.BR np_pipeline_add_sink ()
+are owned by the pipeline and will be freed automatically when
+.BR np_pipeline_free ()
+is called; the caller must not free them.
+.PP
+The
+.BR np_pipeline_add_sink ()
+function attaches an output sink to the pipeline.
+.SH RETURN VALUES
+Sink creation functions return a pointer to a newly allocated
+.B np_sink_t
+on success, or
+.B NULL
+on failure.
+.PP
+.BR np_pipeline_add_sink ()
+returns
+.B NP_OK
+on success, or a negative
+.B np_err_t
+code on failure (see
+.BR libnetpipe (3)).
+.SH NOTES
+.B np_sink_tuntap ()
+and
+.B np_sink_socket ()
+are tagged
+.BR NP_EXPERIMENTAL .
+Do not rely on their URI syntax or output format remaining stable across
+minor releases.
+.SH SEE ALSO
+.BR libnetpipe (3),
+.BR np_pipeline (3),
+.BR netpipe-python (7)

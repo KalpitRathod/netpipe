@@ -1,0 +1,24 @@
+Package: netpipe
+Version: 0.1.0
+Architecture: amd64
+Maintainer: netpipe contributors <dev@netpipe.io>
+Installed-Size: 0
+Depends: libc6 (>= 2.34), libpcap0.8 (>= 1.10), libssl3 (>= 3.0), zlib1g (>= 1:1.2.0)
+Section: net
+Priority: optional
+Homepage: https://github.com/netpipe/netpipe
+Description: Modular stream-processing engine for networking
+ netpipe is a high-performance, pipeline-driven packet processing tool and
+ embeddable C library. It composes sources, filters, processors, and sinks
+ into a processing pipeline that can capture live traffic, read PCAPs,
+ decode protocols (Ethernet/IPv4/IPv6/TCP/UDP/HTTP/DNS/TLS), run Lua
+ scripts per-packet, and emit results to PCAP-NG, sockets, TAP/TUN, etc.
+ .
+ This package provides:
+   * /usr/bin/netpipe           — the command-line tool
+   * /usr/lib/libnetpipe.a      — the static library for embedding
+   * /usr/include/netpipe.h     — the public C API
+   * /usr/share/man/man1/...    — manpages
+   * /usr/share/netpipe/lua/    — bundled Lua scripts (mitigate.lua, test.lua)
+ .
+ Built against libpcap 1.10.x, OpenSSL 3.x, and bundled Lua 5.4.7.

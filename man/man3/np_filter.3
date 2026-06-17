@@ -1,0 +1,89 @@
+.TH NP_FILTER 3 "June 2026" "netpipe v0.1.0" "Library Functions Manual"
+.SH NAME
+np_filter_bpf, np_filter_proto, np_filter_port, np_filter_host, np_filter_and, np_filter_or, np_filter_not, np_filter_free, np_pipeline_add_filter \- netpipe packet filtering
+.SH SYNOPSIS
+.B #include <netpipe.h>
+.PP
+.BI "np_filter_t *np_filter_bpf(const char *" expr ");"
+.br
+.BI "np_filter_t *np_filter_proto(np_proto_t " proto ");"
+.br
+.BI "np_filter_t *np_filter_port(uint16_t " port ");"
+.br
+.BI "np_filter_t *np_filter_host(const char *" host ");"
+.br
+.BI "np_filter_t *np_filter_and(np_filter_t *" a ", np_filter_t *" b ");"
+.br
+.BI "np_filter_t *np_filter_or(np_filter_t *" a ", np_filter_t *" b ");"
+.br
+.BI "np_filter_t *np_filter_not(np_filter_t *" a ");"
+.br
+.BI "void np_filter_free(np_filter_t *" f ");"
+.br
+.BI "np_err_t np_pipeline_add_filter(np_pipeline_t *" pl ", np_filter_t *" f ");"
+.SH DESCRIPTION
+These functions create, compose, and attach packet filters to a pipeline.
+Filters discard packets that do not match specific criteria, preventing them from being processed by subsequent processors and sinks.
+.PP
+The
+.BR np_filter_bpf ()
+function compiles a standard Berkeley Packet Filter (BPF) expression specified by
+.IR expr .
+The syntax matches tcpdump or libpcap capture filter syntax (e.g., "tcp port 443 and host 8.8.8.8").
+.PP
+The
+.BR np_filter_proto ()
+function creates a high-level protocol filter that matches packets containing the protocol specified by
+.I proto
+somewhere in the layer stack (e.g.,
+.BR NP_PROTO_DNS ).
+.PP
+The
+.BR np_filter_port ()
+function creates a filter that matches packets whose TCP or UDP source or destination port equals
+.IR port .
+.PP
+The
+.BR np_filter_host ()
+function creates a filter that matches packets whose source or destination IPv4 address matches the string specified by
+.IR host .
+.PP
+The
+.BR np_filter_and (),
+.BR np_filter_or (),
+and
+.BR np_filter_not ()
+functions allow logical composition of filters.
+They combine or invert existing filters to build arbitrary filter trees.
+The input filter pointers are consumed by these calls (i.e. they become owned by the returned composite filter, and the caller must not free them).
+.PP
+The
+.BR np_filter_free ()
+function releases the resources associated with the specified filter.
+Filters added to a pipeline via
+.BR np_pipeline_add_filter ()
+are automatically managed by the pipeline and will be freed when
+.BR np_pipeline_free ()
+is called; the caller must not free them.
+.PP
+The
+.BR np_pipeline_add_filter ()
+function adds a filter to the pipeline.
+Multiple filters added to a pipeline are logically ANDed together sequentially.
+.SH RETURN VALUES
+The filter creation functions return a pointer to a newly allocated
+.B np_filter_t
+on success, or
+.B NULL
+on failure.
+.PP
+.BR np_pipeline_add_filter ()
+returns
+.B NP_OK
+on success, or a negative
+.B np_err_t
+code on failure.
+.SH SEE ALSO
+.BR libnetpipe (3),
+.BR np_pipeline (3),
+.BR np_packet (3)
