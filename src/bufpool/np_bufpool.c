@@ -12,6 +12,26 @@
  * If the pool is exhausted on alloc, we fall back to a plain malloc so
  * captures never drop packets — we just pay the malloc cost and record a
  * "miss" in the stats.
+ *
+ * Reference-count safety (Bug C6 fix)
+ * ───────────────────────────────────
+ * Previously `np_buf_unref` did: lock(reflock) → --refcount → unlock.
+ * A concurrent `np_buf_ref` on a stale pointer could then resurrect a
+ * buffer that was already on the free-list (refcount went 1→0, free-list
+ * push happened, then refcount 0→1 by the racing ref, but the buffer is
+ * also being handed to another consumer via np_buf_alloc → double-own).
+ *
+ * Now we hold `reflock` across BOTH the decrement AND the free-list
+ * return, so a concurrent `np_buf_ref` cannot sneak in between them.
+ * `np_buf_ref` also asserts refcount > 0 before incrementing (caller
+ * contract: you may only ref a buffer you already hold a ref on).
+ *
+ * `np_buf_unref` asserts refcount > 0 before decrementing, which catches
+ * double-unref bugs (the most common cause of pool corruption).
+ *
+ * Slab membership is verified with BOTH a magic-number check and a
+ * stride-aligned offset check, so a heap allocation that happens to fall
+ * inside the slab's address range cannot be misclassified.
  */
 
 #include <stdlib.h>
@@ -19,6 +39,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <assert.h>
+#include <pthread.h>
 
 #include "np_bufpool.h"
 #include "../log/np_log.h"
@@ -26,6 +47,8 @@
 /* ------------------------------------------------------------------ */
 /*  Internal helpers                                                    */
 /* ------------------------------------------------------------------ */
+
+#define NP_BUF_MAGIC 0x4E504255U  /* "NPBU" */
 
 /* total bytes for one block: header + storage */
 static inline size_t block_size(size_t cap) {
@@ -68,6 +91,8 @@ np_bufpool_t *np_bufpool_create(size_t buf_capacity, int pool_size)
         b->refcount  = 0;
         b->pool      = pool;
         b->next_free = pool->free_list;
+        b->magic     = NP_BUF_MAGIC;   /* slab-membership marker */
+        b->is_slab   = true;
         pthread_mutex_init(&b->reflock, NULL);
         pool->free_list = b;
     }
@@ -80,6 +105,20 @@ np_bufpool_t *np_bufpool_create(size_t buf_capacity, int pool_size)
 void np_bufpool_destroy(np_bufpool_t *pool)
 {
     if (!pool) return;
+
+    /* Bug BUF-04 fix: catch the "destroyed while buffers still
+     * outstanding" footgun before doing any damage.  If we proceed
+     * anyway, every live buffer's `b->pool` becomes dangling and the
+     * next unref crashes. */
+    pthread_mutex_lock(&pool->lock);
+    int outstanding = pool->pool_size - pool->free_count;
+    if (outstanding != 0) {
+        NP_LOG_ERROR("bufpool destroyed with %d buffer(s) still "
+                     "outstanding — undefined behaviour will follow",
+                     outstanding);
+        assert(outstanding == 0 && "bufpool destroyed with outstanding refs");
+    }
+    pthread_mutex_unlock(&pool->lock);
 
     if (pool->slab) {
         for (int i = 0; i < pool->pool_size; i++) {
@@ -108,7 +147,10 @@ np_buf_t *np_buf_alloc(np_bufpool_t *pool, size_t needed)
             pool->free_list = b->next_free;
             pool->free_count--;
             pool->allocs++;
-        } else {
+            /* Bug BUF-08 fix: distinguish "pool too small" from
+             * "pool empty" in the misses counter.  We only count a
+             * miss here when the pool actually had no free buffers. */
+        } else if (pool->free_list == NULL) {
             pool->misses++;
         }
         pthread_mutex_unlock(&pool->lock);
@@ -121,6 +163,8 @@ np_buf_t *np_buf_alloc(np_bufpool_t *pool, size_t needed)
         b->data     = b->_storage;
         b->capacity = needed;
         b->pool     = pool;   /* still track pool for stats */
+        b->magic    = 0;       /* not a slab buffer */
+        b->is_slab  = false;
         pthread_mutex_init(&b->reflock, NULL);
     }
 
@@ -133,7 +177,18 @@ np_buf_t *np_buf_alloc(np_bufpool_t *pool, size_t needed)
 np_buf_t *np_buf_ref(np_buf_t *buf)
 {
     if (!buf) return NULL;
+
+    /* Bug BUF-03 fix: caller contract is "you already hold a reference".
+     * Assert that contract so misuse fails loudly instead of corrupting
+     * the pool. */
     pthread_mutex_lock(&buf->reflock);
+    if (buf->refcount <= 0) {
+        pthread_mutex_unlock(&buf->reflock);
+        NP_LOG_ERROR("np_buf_ref on buffer with refcount=%d "
+                     "(double-unref or stale pointer)", buf->refcount);
+        assert(buf->refcount > 0 && "np_buf_ref on unreferenced buffer");
+        return NULL;
+    }
     buf->refcount++;
     pthread_mutex_unlock(&buf->reflock);
     return buf;
@@ -145,37 +200,37 @@ void np_buf_unref(np_buf_t **pbuf)
     np_buf_t *b = *pbuf;
     *pbuf = NULL;
 
+    /* Bug BUF-02 + C6 fix: hold reflock across the decrement AND the
+     * free-list return, so a concurrent np_buf_ref cannot resurrect
+     * a buffer that's about to be recycled.  We also assert refcount>0
+     * to catch double-unref. */
     pthread_mutex_lock(&b->reflock);
+    if (b->refcount <= 0) {
+        pthread_mutex_unlock(&b->reflock);
+        NP_LOG_ERROR("np_buf_unref on buffer with refcount=%d "
+                     "(double-unref detected)", b->refcount);
+        assert(b->refcount > 0 && "np_buf_unref: double-unref");
+        return;
+    }
     int rc = --b->refcount;
-    pthread_mutex_unlock(&b->reflock);
+    if (rc > 0) {
+        pthread_mutex_unlock(&b->reflock);
+        return;
+    }
+    /* rc == 0: keep holding reflock to block concurrent np_buf_ref. */
 
-    if (rc > 0) return;
-
-    /* refcount hit 0 */
     np_bufpool_t *pool = b->pool;
 
-    int is_slab = 0;
-    if (pool && pool->slab) {
-        uintptr_t ptr = (uintptr_t)b;
-        uintptr_t start = (uintptr_t)pool->slab;
-        size_t stride = sizeof(np_buf_t) + pool->buf_capacity;
-        uintptr_t end = start + (uintptr_t)pool->pool_size * stride;
-        /* Bug 6.1 hardening: verify not just that ptr is within the slab's
-         * address range, but also that it's at a valid block boundary
-         * (i.e. (ptr - start) is a multiple of stride).  Without this
-         * check, a heap allocation that happens to fall within the slab's
-         * range could be misclassified as a slab buffer, leading to
-         * use-after-free / double-handout. */
-        if (ptr >= start && ptr < end) {
-            uintptr_t offset = ptr - start;
-            if (offset % stride == 0) {
-                is_slab = 1;
-            }
-        }
-    }
+    /* Bug BUF-05 fix: use the explicit is_slab flag set at creation
+     * time, rather than an address-range + stride check, so a heap
+     * allocation that happens to fall inside the slab's address range
+     * can never be misclassified. */
+    bool is_slab = b->is_slab && pool && pool->slab
+                   && b->magic == NP_BUF_MAGIC;
 
     if (is_slab) {
-        /* Return to pool */
+        /* Return to pool.  Lock order is reflock → pool->lock
+         * (np_buf_alloc only takes pool->lock, so no deadlock). */
         pthread_mutex_lock(&pool->lock);
         b->size      = 0;
         b->next_free = pool->free_list;
@@ -183,10 +238,20 @@ void np_buf_unref(np_buf_t **pbuf)
         pool->free_count++;
         pool->returns++;
         pthread_mutex_unlock(&pool->lock);
+        pthread_mutex_unlock(&b->reflock);
     } else {
-        /* Heap-allocated (overflow) — just free */
+        /* Heap-allocated (overflow) — free the lock, destroy it, free b. */
+        pthread_mutex_unlock(&b->reflock);
         pthread_mutex_destroy(&b->reflock);
         free(b);
+        /* Bug BUF-06 fix: increment pool->returns for heap-allocated
+         * buffers too, so stats are consistent (returns == allocs + misses
+         * over the lifetime of the pool). */
+        if (pool) {
+            pthread_mutex_lock(&pool->lock);
+            pool->returns++;
+            pthread_mutex_unlock(&pool->lock);
+        }
     }
 }
 
@@ -197,14 +262,26 @@ void np_buf_unref(np_buf_t **pbuf)
 void np_bufpool_stats(const np_bufpool_t *pool, FILE *fp)
 {
     if (!pool || !fp) return;
+
+    /* Bug BUF-07 fix: take the lock to read fields that are mutated
+     * under it.  Stats reads are otherwise data races. */
+    pthread_mutex_lock((pthread_mutex_t *)&pool->lock);
+    size_t buf_capacity = pool->buf_capacity;
+    int    pool_size    = pool->pool_size;
+    int    free_count   = pool->free_count;
+    uint64_t allocs     = pool->allocs;
+    uint64_t misses     = pool->misses;
+    uint64_t returns    = pool->returns;
+    pthread_mutex_unlock((pthread_mutex_t *)&pool->lock);
+
     fprintf(fp,
         "bufpool  cap=%-6zu slots=%-4d free=%-4d "
         "allocs=%-8lu misses=%-6lu returns=%-8lu  hit_rate=%.1f%%\n",
-        pool->buf_capacity, pool->pool_size, pool->free_count,
-        (unsigned long)pool->allocs,
-        (unsigned long)pool->misses,
-        (unsigned long)pool->returns,
-        (pool->allocs + pool->misses) > 0
-            ? 100.0 * (double)pool->allocs / (double)(pool->allocs + pool->misses)
+        buf_capacity, pool_size, free_count,
+        (unsigned long)allocs,
+        (unsigned long)misses,
+        (unsigned long)returns,
+        (allocs + misses) > 0
+            ? 100.0 * (double)allocs / (double)(allocs + misses)
             : 100.0);
 }

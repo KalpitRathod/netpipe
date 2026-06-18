@@ -199,6 +199,14 @@ typedef struct tcp_direction {
      * stream (up to 1 MB per packet on long connections). */
     size_t          last_exposed_len;
 
+    /* Bug H3 fix: track FIN sequence so CLOSED is deferred until
+     * dir_drain() actually consumes all in-order data up to the FIN.
+     * Previously, the FIN handler set state=CLOSED immediately, which
+     * caused subsequent in-order gap-filling segments to be dropped
+     * by the "data on closed flow" check. */
+    bool            fin_seen;
+    uint32_t        fin_seq;       /* seq+paylen of the FIN segment */
+
     /* Hole-tracking */
     bool            hole_open;     /* a gap is currently being skipped */
     uint64_t        hole_open_ms;  /* timestamp the hole opened (CLOCK) */
@@ -209,6 +217,7 @@ typedef struct tcp_direction {
     uint64_t        stat_retransmits;
     uint64_t        stat_gap_flushes;
     uint64_t        stat_bytes_delivered;
+    uint64_t        stat_stream_truncated;  /* Bug H2: bytes dropped at cap */
 
     struct timespec last_seen;     /* for GC of CLOSED flows           */
 
@@ -443,7 +452,17 @@ static np_err_t dir_insert_seg(tcp_direction_t *d,
                 d->total_bytes += gap_len;
             }
             cur_seq += gap_len;
-            if (cur_seq >= seg_end) {
+            /* Bug H1 fix: use signed seq_before comparison instead of
+             * unsigned >=.  When TCP sequence numbers wrap past 2^32,
+             * cur_seq may be a large value (e.g. 0xFFFFFFF8) and
+             * seg_end a small wrapped value (e.g. 0x00000010).  The
+             * unsigned `cur_seq >= seg_end` returns true and breaks
+             * the loop early, silently dropping the wrapped tail.
+             * Signed `!seq_before(cur_seq, seg_end)` correctly treats
+             * the wrap as "cur_seq has caught up to seg_end" only when
+             * they are actually equal or cur_seq is past seg_end in
+             * the signed sense. */
+            if (!seq_before(cur_seq, seg_end)) {
                 cur_len = 0;
                 break;
             }
@@ -521,15 +540,74 @@ static void dir_drain(tcp_direction_t *d, uint64_t now)
 
         if (lead == 0) {
             /* In order — consume. */
+            size_t seg_len = s->len;
             np_err_t e = dir_append_stream(d, s->data, s->len);
             if (e != NP_OK) {
-                NP_LOG_WARN("tcp_stream: stream buffer full, dir=%p", (void*)d);
+                /* Bug H2 fix: dir_append_stream returned NP_ERR_NOMEM,
+                 * meaning the stream buffer hit the 1 MiB cap and only
+                 * `copyable` bytes were stored (not the full s->len).
+                 * The old code advanced next_seq by the FULL s->len,
+                 * which created a silent hole in the reassembled
+                 * stream: bytes [stream_len .. stream_len + (s->len -
+                 * copyable)] were lost and could never be recovered
+                 * (a retransmit would be classified as behind
+                 * next_seq and dropped).
+                 *
+                 * Now we compute the actual bytes stored by re-reading
+                 * stream_len delta, and advance next_seq by only that
+                 * amount.  The remaining bytes of s->data are kept in
+                 * the queue (we shrink the segment instead of
+                 * freeing it) so a future drain after a stream-cap
+                 * reset (e.g. via re-SYN) could still consume them.
+                 *
+                 * In practice the 1 MiB cap is a hard limit, so the
+                 * remaining bytes will be re-classified as "behind"
+                 * on the next packet and dropped — but at least
+                 * next_seq stays consistent and downstream sees a
+                 * truncated stream rather than a corrupt one. */
+                size_t before = d->stream_len;
+                /* dir_append_stream already updated stream_len. */
+                size_t stored = d->stream_len - before;
+                /* Sanity: stored should be <= s->len. */
+                if (stored > seg_len) stored = seg_len;
+                d->stat_stream_truncated += (seg_len - stored);
+                NP_LOG_WARN("tcp_stream: stream buffer full, dir=%p, "
+                            "stored %zu of %zu bytes",
+                            (void*)d, stored, seg_len);
+                if (stored == seg_len) {
+                    /* Defensive: dir_append_stream returned an error
+                     * but all bytes were stored.  Treat as success. */
+                    d->next_seq += (uint32_t)stored;
+                    d->stat_in_order_segs++;
+                    d->segs = s->next;
+                    d->nsegs--;
+                    d->total_bytes -= seg_len;
+                    free(s->data);
+                    free(s);
+                    d->hole_open = false;
+                    continue;
+                } else if (stored == 0) {
+                    /* Nothing stored — stop draining, leave segment
+                     * queued so next_seq doesn't advance. */
+                    break;
+                } else {
+                    /* Partial — advance next_seq by `stored`, shrink
+                     * the segment to the un-stored remainder so the
+                     * next drain iteration sees it again. */
+                    d->next_seq += (uint32_t)stored;
+                    memmove(s->data, s->data + stored, seg_len - stored);
+                    s->seq += (uint32_t)stored;
+                    s->len -= stored;
+                    /* Don't free s; leave it at the head of the queue. */
+                    break;
+                }
             }
-            d->next_seq += s->len;
+            /* e == NP_OK: full segment stored. */
+            d->next_seq += (uint32_t)seg_len;
             d->stat_in_order_segs++;
             d->segs = s->next;
             d->nsegs--;
-            d->total_bytes -= s->len;
+            d->total_bytes -= seg_len;
             free(s->data);
             free(s);
             d->hole_open = false;
@@ -566,6 +644,23 @@ static void dir_drain(tcp_direction_t *d, uint64_t now)
         }
 
         break;  /* gap still within timeout — wait for more segments */
+    }
+
+    /* Bug H3 fix: after draining, check if we've reached the FIN.  If
+     * fin_seen is set and next_seq has caught up to fin_seq, advance
+     * next_seq by 1 (the FIN consumes one sequence number) and mark
+     * the direction CLOSED.  This deferred transition ensures that
+     * out-of-order FINs don't cause subsequent in-order data to be
+     * dropped by the "data on closed flow" check. */
+    if (d->fin_seen && d->next_seq_set &&
+        !seq_before(d->next_seq, d->fin_seq)) {
+        /* next_seq has reached (or passed, via gap flush) the FIN's
+         * sequence number.  Advance by 1 for the FIN itself and mark
+         * CLOSED. */
+        if (d->next_seq == d->fin_seq) {
+            d->next_seq += 1;
+        }
+        d->state = TCP_ST_CLOSED;
     }
 }
 
@@ -737,12 +832,16 @@ static np_err_t tcp_stream_process(np_processor_t *p, np_packet_t *pkt)
             d->stream_len = 0;   /* keep the buffer, just truncate */
             d->last_exposed_len = 0;  /* Bug 2: reset so next packet re-exposes */
             d->hole_open  = false;
+            /* Bug H3 fix: reset FIN tracking on re-SYN. */
+            d->fin_seen = false;
+            d->fin_seq  = 0;
             /* Reset stats so the new connection starts fresh. */
             d->stat_in_order_segs   = 0;
             d->stat_ooo_segs        = 0;
             d->stat_retransmits     = 0;
             d->stat_gap_flushes     = 0;
             d->stat_bytes_delivered = 0;
+            d->stat_stream_truncated = 0;
         }
         d->next_seq     = seq + 1;
         d->next_seq_set = true;
@@ -783,23 +882,24 @@ static np_err_t tcp_stream_process(np_processor_t *p, np_packet_t *pkt)
         }
     }
 
-    /* ---- FIN handling ---- */
+    /* ---- FIN handling (Bug H3 fix) ----
+     *
+     * The FIN consumes one sequence number at fin_seq = seq + paylen.
+     * The OLD code set state=CLOSED immediately, which broke the
+     * case where the FIN arrives out-of-order (its seq is ahead of
+     * next_seq): the data segment(s) before the FIN were inserted
+     * into the queue, but when the missing in-order segment arrived
+     * next, the "data on closed flow" check at the top of this
+     * function dropped it — silently losing data.
+     *
+     * Now we just record fin_seq + fin_seen, and let dir_drain()
+     * transition to CLOSED when next_seq catches up to fin_seq.
+     * dir_drain also advances next_seq by 1 for the FIN itself. */
     if (flags & TCP_FIN) {
-        /* FIN consumes one sequence number.  Insert a zero-length
-         * marker at seq+paylen so dir_drain() advances next_seq past
-         * the FIN, then mark CLOSED.  We do this by directly
-         * advancing next_seq when the queue has drained up to FIN. */
-        if (d->next_seq_set) {
-            /* The FIN's sequence number is seq + paylen.  When the
-             * in-order queue drains to that point, mark closed. */
-            uint32_t fin_seq = seq + (uint32_t)paylen;
-            /* We can't directly insert a zero-len seg (it would be a
-             * no-op).  Instead, set state CLOSED now; dir_drain() will
-             * still finish consuming any queued data first, then GC
-             * will retire the direction. */
-            (void)fin_seq;
+        if (!d->fin_seen) {
+            d->fin_seen = true;
+            d->fin_seq  = seq + (uint32_t)paylen;
         }
-        d->state = TCP_ST_CLOSED;
     }
 
     /* Drain any segments that are now in-order. */

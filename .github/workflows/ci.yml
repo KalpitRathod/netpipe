@@ -12,7 +12,14 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y libpcap-dev valgrind
+          # Bug CI fix: the Makefile links against -lssl -lcrypto (OpenSSL)
+          # and -llua (Lua 5.4) when the vendored lua-5.4.7/ tree is not
+          # present.  The old apt line only installed libpcap-dev and
+          # valgrind, so `make` failed at link time on the very first
+          # step.  Now we install all three: libpcap-dev, libssl-dev,
+          # and the Lua 5.4 dev package (used as a fallback when the
+          # vendored lua-5.4.7/ directory is absent from the checkout).
+          sudo apt install -y libpcap-dev libssl-dev liblua5.4-dev valgrind
 
       - name: Build release version
         run: make

@@ -64,7 +64,12 @@ void np_evloop_run(np_evloop_t *loop);
 /* Signal the loop to stop after the current epoll_wait returns.       */
 void np_evloop_stop(np_evloop_t *loop);
 
-/* Free the loop.  All registered fds are NOT closed.                  */
+/*
+ * Free the loop.  Regular (non-timer) fds are NOT closed — caller
+ * owns them.  Timer fds created via np_evloop_add_timer() ARE closed
+ * and their timer_ctx_t is freed (the loop owns these).  Caller must
+ * ensure no other thread is inside np_evloop_run() when this is called.
+ */
 void np_evloop_free(np_evloop_t *loop);
 
 /* ------------------------------------------------------------------ */

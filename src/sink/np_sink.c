@@ -13,7 +13,12 @@
 #include <stdio.h>
 #include <time.h>
 #include <errno.h>
+#include <limits.h>
 #include <arpa/inet.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
 #include <pcap/pcap.h>
 
 #include "netpipe.h"
@@ -82,6 +87,16 @@ static np_err_t pcap_sink_write(np_sink_t *s, const np_packet_t *pkt)
     hdr.caplen = pkt->caplen;
     hdr.len    = pkt->wirelen;
     pcap_dump((u_char *)p->dumper, &hdr, pkt->raw);
+    /* Bug M12 fix: pcap_dump doesn't return a value, but errors are
+     * captured in the pcap_t's error buffer.  Check it after every
+     * write so disk-full / I/O errors don't silently corrupt the
+     * output file.  Also check ferror on the underlying FILE. */
+    if (ferror(pcap_dump_file(p->dumper))) {
+        NP_LOG_ERROR("pcap_sink: write error on '%s': %s",
+                     p->path, pcap_geterr(p->fake));
+        clearerr(pcap_dump_file(p->dumper));
+        return NP_ERR_IO;
+    }
     return NP_OK;
 }
 
@@ -134,12 +149,29 @@ static np_err_t json_sink_open(np_sink_t *s, np_linktype_t lt)
 static void fprint_json_str(FILE *fp, const char *str, size_t len) {
     fputc('"', fp);
     for (size_t i = 0; i < len; i++) {
-        char c = str[i];
-        if (c == '"' || c == '\\') { fputc('\\', fp); fputc(c, fp); }
+        /* Bug H5 fix: use unsigned char so bytes >= 0x80 are
+         * interpreted as 128-255 rather than negative values.  The old
+         * code (signed char) silently dropped every byte > 0x7e,
+         * producing invalid/truncated JSON for any binary or UTF-8
+         * payload.  Now we emit `\u00XX` for non-ASCII control bytes
+         * and pass through bytes >= 0x80 as-is (UTF-8 passthrough,
+         * which is valid JSON per RFC 8259 §7). */
+        unsigned char c = (unsigned char)str[i];
+        if (c == '"' || c == '\\') { fputc('\\', fp); fputc((int)c, fp); }
         else if (c == '\n') fputs("\\n", fp);
         else if (c == '\r') fputs("\\r", fp);
         else if (c == '\t') fputs("\\t", fp);
-        else if (c >= 0x20 && c <= 0x7e) fputc(c, fp);
+        else if (c == '\b') fputs("\\b", fp);
+        else if (c == '\f') fputs("\\f", fp);
+        else if (c < 0x20) {
+            /* Other control chars — emit \u00XX escape. */
+            fprintf(fp, "\\u%04x", (unsigned int)c);
+        } else {
+            /* Printable ASCII (0x20..0x7e) or UTF-8 byte (0x80..0xFF):
+             * pass through verbatim.  RFC 8259 permits raw UTF-8 in
+             * JSON strings. */
+            fputc((int)c, fp);
+        }
     }
     fputc('"', fp);
 }
@@ -833,7 +865,15 @@ static np_err_t tuntap_sink_write(np_sink_t *s, const np_packet_t *pkt)
         if (!p->is_tun && !pkt->eth) {
             /* Missing Ethernet header on a Layer 2 TAP interface.
              * This happens when replaying SLL-captured PCAPs (like from wlo1).
-             * We must synthesize a 14-byte Ethernet header. */
+             * We must synthesize a 14-byte Ethernet header.
+             *
+             * Bug M10 fix: also pad the total frame to 60 bytes (the
+             * Ethernet minimum, excluding FCS).  The old code wrote
+             * only 14+buflen bytes via writev, producing a runt frame
+             * for any packet with buflen < 46.  tcpdump/wireshark flag
+             * such frames as malformed.  Now we use a 3-iov writev:
+             * [eth_hdr][payload][zero-pad] and only include the pad
+             * iov when 14+buflen < 60. */
             uint8_t eth_hdr[14] = {
                 0x02, 0x00, 0x00, 0x00, 0x00, 0x01, /* dst MAC */
                 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, /* src MAC */
@@ -842,12 +882,20 @@ static np_err_t tuntap_sink_write(np_sink_t *s, const np_packet_t *pkt)
             if (pkt->net && pkt->net->proto == NP_PROTO_IP6) {
                 eth_hdr[12] = 0x86; eth_hdr[13] = 0xDD;
             }
-            struct iovec iov[2];
+            size_t total = 14 + buflen;
+            struct iovec iov[3];
+            int n_iov = 2;
             iov[0].iov_base = eth_hdr;
             iov[0].iov_len  = 14;
             iov[1].iov_base = (void *)buf;
             iov[1].iov_len  = buflen;
-            if (writev(p->fd, iov, 2) < 0) return NP_ERR_IO;
+            if (total < 60) {
+                static const uint8_t zero_pad[60] = {0};
+                iov[2].iov_base = (void *)zero_pad;
+                iov[2].iov_len  = 60 - total;
+                n_iov = 3;
+            }
+            if (writev(p->fd, iov, n_iov) < 0) return NP_ERR_IO;
         } else if (!p->is_tun && buflen < 60) {
             /* Ethernet mandates a minimum frame size of 60 bytes (excluding
              * the 4-byte FCS).  PCAPs captured from short packets (e.g. ARP
@@ -976,34 +1024,54 @@ typedef struct {
     char host[128];
     int port;
     np_sock_fmt_t fmt;
+    np_linktype_t linktype;   /* remembered for reconnect */
+    bool       header_sent;   /* pcap global header sent? */
+    uint64_t   reconnect_attempts;
+    uint64_t   packets_dropped_disconnected;
 } socket_sink_priv_t;
+
+/* Bug M11 fix: replace gethostbyname (not thread-safe, no IPv6) with
+ * getaddrinfo.  Returns connected fd or -1 on failure. */
+static int socket_sink_connect(const char *host, int port)
+{
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_UNSPEC;     /* accept IPv4 or IPv6 */
+    hints.ai_socktype = SOCK_STREAM;
+
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+
+    struct addrinfo *res = NULL;
+    int gai_rc = getaddrinfo(host, port_str, &hints, &res);
+    if (gai_rc != 0) {
+        NP_LOG_ERROR("socket: getaddrinfo(%s:%d): %s",
+                     host, port, gai_strerror(gai_rc));
+        return -1;
+    }
+
+    int fd = -1;
+    for (struct addrinfo *rp = res; rp; rp = rp->ai_next) {
+        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (fd < 0) continue;
+        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
+            break;  /* success */
+        }
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    return fd;
+}
 
 static np_err_t socket_sink_open(np_sink_t *s, np_linktype_t lt)
 {
     socket_sink_priv_t *p = s->priv;
+    p->linktype = lt;
+    p->header_sent = false;
 
-    struct hostent *he = gethostbyname(p->host);
-    if (!he) {
-        NP_LOG_ERROR("socket: unknown host %s", p->host);
-        return NP_ERR_GENERIC;
-    }
-
-    p->fd = socket(AF_INET, SOCK_STREAM, 0);
+    p->fd = socket_sink_connect(p->host, p->port);
     if (p->fd < 0) {
-        NP_LOG_ERROR("%s", "socket: creation failed");
-        return NP_ERR_GENERIC;
-    }
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((uint16_t)p->port);
-    memcpy(&addr.sin_addr, he->h_addr_list[0], (size_t)he->h_length);
-
-    if (connect(p->fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        NP_LOG_ERROR("socket: failed to connect to %s:%d", p->host, p->port);
-        close(p->fd);
-        p->fd = -1;
         return NP_ERR_GENERIC;
     }
 
@@ -1035,6 +1103,7 @@ static np_err_t socket_sink_open(np_sink_t *s, np_linktype_t lt)
             p->fd = -1;
             return NP_ERR_IO;
         }
+        p->header_sent = true;
     } else {
         NP_LOG_INFO("socket sink: formatting as %s",
                      p->fmt == NP_SOCK_FMT_JSON ? "json" : "hex");
@@ -1043,10 +1112,63 @@ static np_err_t socket_sink_open(np_sink_t *s, np_linktype_t lt)
     return NP_OK;
 }
 
+/* Bug H6 fix: attempt to reconnect if the connection was lost.
+ * Returns true if the connection is live (or was re-established),
+ * false if reconnection failed.  Exponential backoff is implicit
+ * because we only attempt reconnect on each write — if the peer
+ * stays down, we try once per packet, which naturally rate-limits. */
+static bool socket_sink_ensure_connected(socket_sink_priv_t *p)
+{
+    if (p->fd >= 0) return true;
+    p->reconnect_attempts++;
+    NP_LOG_INFO("socket: reconnecting to %s:%d (attempt %lu)",
+                p->host, p->port, (unsigned long)p->reconnect_attempts);
+    p->fd = socket_sink_connect(p->host, p->port);
+    if (p->fd < 0) {
+        return false;
+    }
+    /* Re-send the pcap global header if applicable. */
+    if (p->fmt == NP_SOCK_FMT_PCAP && p->header_sent) {
+        struct {
+            uint32_t magic;
+            uint16_t major;
+            uint16_t minor;
+            int32_t  thiszone;
+            uint32_t sigfigs;
+            uint32_t snaplen;
+            uint32_t network;
+        } __attribute__((packed)) ghdr = {
+            .magic    = 0xa1b2c3d4,
+            .major    = 2,
+            .minor    = 4,
+            .thiszone = 0,
+            .sigfigs  = 0,
+            .snaplen  = 65535,
+            .network  = (uint32_t)p->linktype,
+        };
+        if (send_all(p->fd, &ghdr, sizeof(ghdr), 0) < 0) {
+            close(p->fd);
+            p->fd = -1;
+            return false;
+        }
+    }
+    NP_LOG_INFO("socket: reconnected to %s:%d", p->host, p->port);
+    return true;
+}
+
 static np_err_t socket_sink_write(np_sink_t *s, const np_packet_t *pkt)
 {
     socket_sink_priv_t *p = s->priv;
-    if (p->fd < 0) return NP_ERR_GENERIC;
+
+    /* Bug H6 fix: if the connection is down, try to reconnect.  If
+     * reconnection fails, count and drop the packet rather than
+     * killing the pipeline. */
+    if (p->fd < 0) {
+        if (!socket_sink_ensure_connected(p)) {
+            p->packets_dropped_disconnected++;
+            return NP_OK;  /* don't propagate error — pipeline would stop */
+        }
+    }
 
     if (p->fmt == NP_SOCK_FMT_PCAP) {
         /* Write a PCAP per-packet record header before the raw bytes */
@@ -1063,12 +1185,20 @@ static np_err_t socket_sink_write(np_sink_t *s, const np_packet_t *pkt)
         };
 
         if (send_all(p->fd, &phdr, sizeof(phdr), MSG_MORE) < 0) {
-            NP_LOG_ERROR("%s", "socket: write failed (packet header)");
-            return NP_ERR_IO;
+            NP_LOG_ERROR("%s", "socket: write failed (packet header) — "
+                                  "will attempt reconnect on next write");
+            close(p->fd);
+            p->fd = -1;
+            p->packets_dropped_disconnected++;
+            return NP_OK;
         }
         if (send_all(p->fd, pkt->raw, pkt->caplen, 0) < 0) {
-            NP_LOG_ERROR("%s", "socket: write failed (packet data)");
-            return NP_ERR_IO;
+            NP_LOG_ERROR("%s", "socket: write failed (packet data) — "
+                                  "will attempt reconnect on next write");
+            close(p->fd);
+            p->fd = -1;
+            p->packets_dropped_disconnected++;
+            return NP_OK;
         }
         return NP_OK;
     }
@@ -1094,8 +1224,12 @@ static np_err_t socket_sink_write(np_sink_t *s, const np_packet_t *pkt)
     np_err_t ret = NP_OK;
     if (send_all(p->fd, buf, buflen, MSG_MORE) < 0 ||
         send_all(p->fd, "\n", 1, 0) < 0) {
-        NP_LOG_ERROR("%s", "socket: write failed (formatted record)");
-        ret = NP_ERR_IO;
+        NP_LOG_ERROR("%s", "socket: write failed (formatted record) — "
+                              "will attempt reconnect on next write");
+        close(p->fd);
+        p->fd = -1;
+        p->packets_dropped_disconnected++;
+        ret = NP_OK;  /* don't kill the pipeline */
     }
 
     free(buf);
@@ -1228,6 +1362,15 @@ static np_err_t pcapng_sink_write(np_sink_t *s, const np_packet_t *pkt)
     pcapng_sink_priv_t *p = s->priv;
     if (!p->fp) return NP_ERR_IO;
 
+    /* Bug M7 fix: defensive cap on caplen to avoid integer overflow
+     * in the block_len computation.  PCAP-NG blocks can theoretically
+     * be up to 4 GB, but real captures are bounded by snaplen (65535). */
+    if (pkt->caplen > 65535) {
+        NP_LOG_WARN("pcapng_sink: caplen %u exceeds 65535, truncating",
+                    pkt->caplen);
+        return NP_ERR_IO;
+    }
+
     /* Calculate padding */
     size_t padded_len = (pkt->caplen + 3) & ~3U;
     size_t padding_bytes = padded_len - pkt->caplen;
@@ -1241,25 +1384,37 @@ static np_err_t pcapng_sink_write(np_sink_t *s, const np_packet_t *pkt)
     uint32_t epb_type = 0x00000006;
     uint32_t iface_id = 0;
 
-    fwrite(&epb_type, 4, 1, p->fp);
-    fwrite(&block_len, 4, 1, p->fp);
-    fwrite(&iface_id, 4, 1, p->fp);
-    fwrite(&ts_high, 4, 1, p->fp);
-    fwrite(&ts_low, 4, 1, p->fp);
-    fwrite(&pkt->caplen, 4, 1, p->fp);
-    fwrite(&pkt->wirelen, 4, 1, p->fp);
+    /* Bug M12 fix: check fwrite return values so disk-full / I/O
+     * errors don't silently corrupt the pcapng file.  We use a
+     * helper macro to keep the code readable. */
+#define FW(ptr, sz, n, fp) do { \
+        if (fwrite((ptr), (sz), (n), (fp)) != (n)) { \
+            NP_LOG_ERROR("pcapng_sink: short write on '%s'", p->path); \
+            clearerr((fp)); \
+            return NP_ERR_IO; \
+        } \
+    } while (0)
+
+    FW(&epb_type, 4, 1, p->fp);
+    FW(&block_len, 4, 1, p->fp);
+    FW(&iface_id, 4, 1, p->fp);
+    FW(&ts_high, 4, 1, p->fp);
+    FW(&ts_low, 4, 1, p->fp);
+    FW(&pkt->caplen, 4, 1, p->fp);
+    FW(&pkt->wirelen, 4, 1, p->fp);
 
     /* Write packet data */
-    fwrite(pkt->raw, 1, pkt->caplen, p->fp);
+    FW(pkt->raw, 1, pkt->caplen, p->fp);
 
     /* Write padding */
     if (padding_bytes > 0) {
         uint8_t pad[3] = {0, 0, 0};
-        fwrite(pad, 1, padding_bytes, p->fp);
+        FW(pad, 1, padding_bytes, p->fp);
     }
 
     /* Write trailing Block Total Length */
-    fwrite(&block_len, 4, 1, p->fp);
+    FW(&block_len, 4, 1, p->fp);
+#undef FW
 
     fflush(p->fp);
     return NP_OK;

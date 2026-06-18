@@ -8,6 +8,8 @@
 
 #include "netpipe.h"
 #include <pthread.h>
+#include <stdatomic.h>
+#include <stdbool.h>
 
 /* Forward declarations for internal sub-structures */
 struct np_source_ops {
@@ -77,13 +79,16 @@ struct np_pipeline {
     np_sink_t      *sinks     [NP_MAX_SINKS];
     int             nsinks;
 
-    volatile bool   running;
+    /* Bug P4 fix: use _Atomic bool instead of volatile bool for
+     * proper cross-thread visibility under the C11 memory model. */
+    _Atomic bool    running;
     pthread_mutex_t lock;
 
     /* stats */
     uint64_t        pkts_captured;
     uint64_t        pkts_filtered;
     uint64_t        pkts_processed;
+    uint64_t        pkts_dropped;   /* Bug P7 fix: queue overflow counter */
     uint64_t        bytes_captured;
 };
 

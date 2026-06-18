@@ -10,6 +10,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <time.h>
+#include <stdatomic.h>
 
 #include "netpipe.h"
 #include "../log/np_log.h"
@@ -26,7 +27,7 @@ np_pipeline_t *np_pipeline_new(void)
     np_pipeline_t *pl = calloc(1, sizeof(*pl));
     if (!pl) return NULL;
     pthread_mutex_init(&pl->lock, NULL);
-    pl->running = false;
+    atomic_init(&pl->running, false);
     return pl;
 }
 
@@ -78,7 +79,7 @@ np_err_t np_pipeline_add_sink(np_pipeline_t *pl, np_sink_t *s)
 
 void np_pipeline_stop(np_pipeline_t *pl)
 {
-    pl->running = false;
+    atomic_store(&pl->running, false);
     for (int i = 0; i < pl->nsources; i++) {
         if (pl->sources[i]->ops->stop) {
             pl->sources[i]->ops->stop(pl->sources[i]);
@@ -108,7 +109,8 @@ typedef struct {
     np_source_t   *src;
     pkt_queue_t   *q;
     pthread_t      thread;
-    volatile bool  running;
+    _Atomic bool   running;       /* Bug P4 fix: atomic for cross-thread visibility */
+    bool           thread_created; /* Bug P3 fix: track so we only join if created */
 } src_worker_t;
 
 static void queue_init(pkt_queue_t *q)
@@ -120,11 +122,13 @@ static void queue_init(pkt_queue_t *q)
     pthread_cond_init(&q->cond, NULL);
 }
 
-static void queue_push(pkt_queue_t *q, np_packet_t *pkt, np_linktype_t linktype)
+static void queue_push(pkt_queue_t *q, np_packet_t *pkt, np_linktype_t linktype,
+                     uint64_t *dropped_counter)
 {
     queue_node_t *node = malloc(sizeof(*node));
     if (!node) {
         np_packet_free(pkt);
+        if (dropped_counter) (*dropped_counter)++;
         return;
     }
     node->pkt = pkt;
@@ -137,6 +141,7 @@ static void queue_push(pkt_queue_t *q, np_packet_t *pkt, np_linktype_t linktype)
         pthread_mutex_unlock(&q->lock);
         free(node);
         np_packet_free(pkt);
+        if (dropped_counter) (*dropped_counter)++;
         return;
     }
     if (!q->tail) {
@@ -212,7 +217,7 @@ static void *src_worker_fn(void *arg)
     np_source_t *src = w->src;
     pkt_queue_t *q = w->q;
 
-    while (w->running && w->pl->running) {
+    while (atomic_load(&w->running) && atomic_load(&w->pl->running)) {
         np_packet_t *pkt = NULL;
         np_err_t e = src->ops->next(src, &pkt);
 
@@ -227,10 +232,10 @@ static void *src_worker_fn(void *arg)
             continue;
         }
 
-        queue_push(q, pkt, src->linktype);
+        queue_push(q, pkt, src->linktype, &w->pl->pkts_dropped);
     }
 
-    w->running = false;
+    atomic_store(&w->running, false);
     return NULL;
 }
 
@@ -248,25 +253,61 @@ np_err_t np_pipeline_run(np_pipeline_t *pl)
         NP_LOG_WARN("%s", "no sinks configured — packets will be discarded");
     }
 
+    /* Bug C5 fix: reject mixed-linktype pipelines at run-time.  If
+     * sources have different link types (e.g. Ethernet + Loopback),
+     * all sinks would be opened with sources[0]'s linktype, and
+     * packets from the other sources would be written with the wrong
+     * framing — producing corrupt output files.  The proper fix
+     * would be to support per-packet linktype at the sink layer
+     * (e.g. via PCAP-NG Interface Description Blocks), but that's a
+     * larger change.  For now, refuse to run. */
+    if (pl->nsources > 1) {
+        np_linktype_t first = pl->sources[0]->linktype;
+        for (int i = 1; i < pl->nsources; i++) {
+            if (pl->sources[i]->linktype != first) {
+                NP_LOG_ERROR("mixed linktypes across sources: "
+                            "sources[0]=%d vs sources[%d]=%d. "
+                            "Mixed-linktype pipelines are not supported.",
+                            first, i, pl->sources[i]->linktype);
+                return NP_ERR_GENERIC;
+            }
+        }
+    }
+
     /* Open all sources */
+    int opened_sources = 0;
     for (int i = 0; i < pl->nsources; i++) {
         np_err_t e = pl->sources[i]->ops->open(pl->sources[i]);
         if (e != NP_OK) {
             NP_LOG_ERROR("failed to open source '%s'", pl->sources[i]->name);
+            /* Bug P5 fix: close already-opened sources before returning. */
+            for (int j = 0; j < opened_sources; j++) {
+                pl->sources[j]->ops->close(pl->sources[j]);
+            }
             return e;
         }
         NP_LOG_INFO("source '%s' opened (linktype=%d)",
                     pl->sources[i]->name, pl->sources[i]->linktype);
+        opened_sources++;
     }
 
     /* Open all sinks now that linktypes are known */
     np_linktype_t lt = pl->nsources > 0 ? pl->sources[0]->linktype : NP_LINK_ETHERNET;
+    int opened_sinks = 0;
     for (int i = 0; i < pl->nsinks; i++) {
         np_err_t e = pl->sinks[i]->ops->open(pl->sinks[i], lt);
         if (e != NP_OK) {
             NP_LOG_ERROR("failed to open sink '%s'", pl->sinks[i]->name);
+            /* Bug P5 fix: close already-opened sources AND sinks. */
+            for (int j = 0; j < opened_sinks; j++) {
+                pl->sinks[j]->ops->close(pl->sinks[j]);
+            }
+            for (int j = 0; j < opened_sources; j++) {
+                pl->sources[j]->ops->close(pl->sources[j]);
+            }
             return e;
         }
+        opened_sinks++;
     }
 
     pkt_queue_t q;
@@ -275,23 +316,58 @@ np_err_t np_pipeline_run(np_pipeline_t *pl)
     src_worker_t *workers = calloc((size_t)pl->nsources, sizeof(src_worker_t));
     if (!workers) {
         queue_free(&q);
+        /* Bug P5 fix: close sources and sinks we just opened. */
+        for (int j = 0; j < opened_sources; j++) {
+            pl->sources[j]->ops->close(pl->sources[j]);
+        }
+        for (int j = 0; j < opened_sinks; j++) {
+            pl->sinks[j]->ops->close(pl->sinks[j]);
+        }
         return NP_ERR_NOMEM;
     }
 
-    pl->running = true;
+    atomic_store(&pl->running, true);
     NP_LOG_INFO("pipeline running (%d source(s), %d filter(s), %d proc(s), %d sink(s))",
                 pl->nsources, pl->nfilters, pl->nprocessors, pl->nsinks);
 
     // Spawn capture threads
+    int spawned_workers = 0;
     for (int i = 0; i < pl->nsources; i++) {
         workers[i].pl = pl;
         workers[i].src = pl->sources[i];
         workers[i].q = &q;
-        workers[i].running = true;
-        pthread_create(&workers[i].thread, NULL, src_worker_fn, &workers[i]);
+        atomic_store(&workers[i].running, true);
+        workers[i].thread_created = false;
+        /* Bug P3 fix: check pthread_create return value.  On EAGAIN
+         * (thread exhaustion) the thread handle is uninitialized;
+         * calling pthread_join on it is undefined behaviour. */
+        int rc = pthread_create(&workers[i].thread, NULL, src_worker_fn, &workers[i]);
+        if (rc != 0) {
+            NP_LOG_ERROR("pthread_create for source %d failed: %s",
+                         i, strerror(rc));
+            atomic_store(&workers[i].running, false);
+            /* Signal the queue so any already-spawned workers can wake
+             * up and notice pl->running went false (set below). */
+            continue;
+        }
+        workers[i].thread_created = true;
+        spawned_workers++;
+    }
+    if (spawned_workers == 0) {
+        NP_LOG_ERROR("%s", "no capture threads could be spawned — aborting");
+        atomic_store(&pl->running, false);
+        free(workers);
+        queue_free(&q);
+        for (int j = 0; j < opened_sources; j++) {
+            pl->sources[j]->ops->close(pl->sources[j]);
+        }
+        for (int j = 0; j < opened_sinks; j++) {
+            pl->sinks[j]->ops->close(pl->sinks[j]);
+        }
+        return NP_ERR_GENERIC;
     }
 
-    while (pl->running) {
+    while (atomic_load(&pl->running)) {
         np_packet_t *pkt = NULL;
         np_linktype_t pkt_lt;
         bool got = queue_pop(&q, &pkt, &pkt_lt, 10);
@@ -347,27 +423,73 @@ np_err_t np_pipeline_run(np_pipeline_t *pl)
             // Check if all source threads have finished
             bool all_done = true;
             for (int i = 0; i < pl->nsources; i++) {
-                if (workers[i].running) {
+                if (atomic_load(&workers[i].running)) {
                     all_done = false;
                     break;
                 }
             }
-            if (all_done && q.size == 0) {
-                break;
+            if (all_done) {
+                /* Bug H10 fix: drain the queue before exiting.  The
+                 * old code unlocked-read q.size, which races with
+                 * producer threads.  queue_pop already drained the
+                 * queue (it returned false because of the 10ms
+                 * timeout, not because the queue was empty), so if
+                 * all_done is true AND the queue is truly empty, we
+                 * can exit.  We re-check by attempting one more
+                 * non-blocking pop. */
+                np_packet_t *drain_pkt = NULL;
+                np_linktype_t drain_lt;
+                if (!queue_pop(&q, &drain_pkt, &drain_lt, 0)) {
+                    break;  /* queue empty AND no producers running */
+                }
+                /* Re-process the drained packet. */
+                pl->pkts_captured++;
+                pl->bytes_captured += drain_pkt->caplen;
+                drain_pkt->seq = pl->pkts_captured;
+                np_demux_packet(drain_pkt, drain_lt);
+                bool pass = true;
+                for (int fi = 0; fi < pl->nfilters && pass; fi++) {
+                    pass = pl->filters[fi]->ops->match(pl->filters[fi], drain_pkt);
+                }
+                if (pass) {
+                    bool proc_pass = true;
+                    for (int pi = 0; pi < pl->nprocessors; pi++) {
+                        np_err_t pe = pl->processors[pi]->ops->process(pl->processors[pi], drain_pkt);
+                        if (pe != NP_OK) { proc_pass = false; break; }
+                    }
+                    if (proc_pass) {
+                        pl->pkts_processed++;
+                        for (int ki = 0; ki < pl->nsinks; ki++) {
+                            pl->sinks[ki]->ops->write(pl->sinks[ki], drain_pkt);
+                        }
+                    } else {
+                        pl->pkts_filtered++;
+                    }
+                } else {
+                    pl->pkts_filtered++;
+                }
+                np_packet_free(drain_pkt);
             }
         }
     }
 
     // Stop and join workers
-    pl->running = false;
+    atomic_store(&pl->running, false);
     for (int i = 0; i < pl->nsources; i++) {
-        workers[i].running = false;
+        atomic_store(&workers[i].running, false);
         if (pl->sources[i]->ops->stop) {
             pl->sources[i]->ops->stop(pl->sources[i]);
         }
     }
+    /* Wake any worker blocked on queue_push (it holds q.lock briefly
+     * so this isn't required, but signal anyway). */
+    pthread_mutex_lock(&q.lock);
+    pthread_cond_broadcast(&q.cond);
+    pthread_mutex_unlock(&q.lock);
     for (int i = 0; i < pl->nsources; i++) {
-        pthread_join(workers[i].thread, NULL);
+        if (workers[i].thread_created) {
+            pthread_join(workers[i].thread, NULL);
+        }
     }
 
     /* Teardown */
@@ -381,10 +503,11 @@ np_err_t np_pipeline_run(np_pipeline_t *pl)
     free(workers);
     queue_free(&q);
 
-    NP_LOG_INFO("pipeline stopped — captured=%lu  filtered=%lu  processed=%lu  bytes=%lu",
+    NP_LOG_INFO("pipeline stopped — captured=%lu  filtered=%lu  processed=%lu  dropped=%lu  bytes=%lu",
                 (unsigned long)pl->pkts_captured,
                 (unsigned long)pl->pkts_filtered,
                 (unsigned long)pl->pkts_processed,
+                (unsigned long)pl->pkts_dropped,
                 (unsigned long)pl->bytes_captured);
 
     return NP_OK;

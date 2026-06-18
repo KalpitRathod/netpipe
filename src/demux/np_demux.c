@@ -132,18 +132,11 @@ static np_err_t decode_eth(np_packet_t *pkt,
     const uint8_t *payload = data + sizeof(eth_hdr_t);
     size_t         paylen  = len  - sizeof(eth_hdr_t);
 
-    /* outer QinQ tag (S-TAG, 0x88A8): skip 4 bytes, then expect an inner tag */
-    if (et == 0x88A8 && paylen >= 4) {
-        uint16_t v;
-        memcpy(&v, payload + 2, sizeof(v));
-        et       = ntohs(v);          /* should be 0x8100 (C-TAG) */
-        payload += 4;
-        paylen  -= 4;
-        eth_hdr_total += 4;
-    }
-
-    /* single 802.1Q tag (C-TAG, 0x8100): skip 4 bytes to reach inner EtherType */
-    if (et == 0x8100 && paylen >= 4) {
+    /* Bug M1 fix: skip VLAN tags in a LOOP (handles stacked 0x8100,
+     * 0x88A8/0x8100 QinQ, and triple-tagged frames).  The old code
+     * used two sequential `if` statements which broke on stacked
+     * 0x8100 (some carriers use 0x8100 for both S-TAG and C-TAG). */
+    while ((et == 0x88A8 || et == 0x8100) && paylen >= 4) {
         uint16_t v;
         memcpy(&v, payload + 2, sizeof(v));
         et       = ntohs(v);
@@ -208,13 +201,23 @@ static np_err_t decode_ip6(np_packet_t *pkt,
     if (!l) return NP_ERR_GENERIC;
     pkt->net = l;
 
-    /* basic flow hash from first 4 bytes of src+dst */
+    /* Bug M2 fix: hash ALL 16 bytes of each IPv6 address, not just
+     * the first 4.  The old code only hashed 4 bytes of src + 4 of
+     * dst, so flows like 2001:db8:1::1 and 2001:db8:1:2::1 (which
+     * share the first 4 bytes) collided in flow_id.  This is
+     * inconsistent with np_tcp_stream.c which hashes all 16 bytes,
+     * and causes flow-tracking collisions in the demuxer. */
     uint32_t h = 5381;
-    uint32_t src_w, dst_w;
-    memcpy(&src_w, ip6->src, sizeof(src_w));
-    memcpy(&dst_w, ip6->dst, sizeof(dst_w));
-    h = hash_u32(h, src_w);
-    h = hash_u32(h, dst_w);
+    for (int i = 0; i < 16; i += 4) {
+        uint32_t w;
+        memcpy(&w, ip6->src + i, 4);
+        h = hash_u32(h, w);
+    }
+    for (int i = 0; i < 16; i += 4) {
+        uint32_t w;
+        memcpy(&w, ip6->dst + i, 4);
+        h = hash_u32(h, w);
+    }
     h ^= ip6->next_header;
     pkt->flow_id = h;
 
@@ -706,39 +709,38 @@ np_err_t np_demux_packet(np_packet_t *pkt, np_linktype_t linktype)
         const uint8_t *after_eth = data + sizeof(eth_hdr_t);
         size_t         after_len = len  - sizeof(eth_hdr_t);
 
-        /* skip outer QinQ tag (0x88A8, S-TAG) if present.
-         * Bug 5 fix: use memcpy instead of unaligned uint16_t deref
-         * (packet data has no alignment guarantee — UB on ARM/RISC-V). */
-        if (et == 0x88A8 && after_len >= 4) {
+        /* Bug M1 fix: skip VLAN tags in a LOOP, not with two separate
+         * `if` statements.  The old code only handled one 0x88A8 and
+         * one 0x8100 tag, which is correct for the common QinQ case
+         * (outer 0x88A8 + inner 0x8100) but breaks on:
+         *   - Stacked 0x8100 (some carriers use 0x8100 for both S-TAG
+         *     and C-TAG).
+         *   - Triple-tagged frames (rare but valid).
+         * The loop handles any number of tags. */
+        while ((et == 0x88A8 || et == 0x8100) && after_len >= 4) {
             uint16_t v;
             memcpy(&v, after_eth + 2, sizeof(v));
-            et        = ntohs(v);
-            after_eth += 4;
-            after_len -= 4;
-        }
-        /* skip single 802.1Q tag (0x8100, C-TAG) if present.
-         * Bug 5 fix: same memcpy fix. */
-        if (et == 0x8100 && after_len >= 4) {
-            uint16_t v;
-            memcpy(&v, after_eth + 2, sizeof(v));
-            et        = ntohs(v);
+            et = ntohs(v);
             after_eth += 4;
             after_len -= 4;
         }
         if (et == 0x0800) {
-            decode_ip4(pkt, after_eth, after_len);
-            if (after_len >= sizeof(ip4_hdr_t)) {
+            /* Bug M3 fix: check decode_ip4 return value so a malformed
+             * IP header (IHL<5, version!=4) doesn't fall through to
+             * the transport-layer parsing below. */
+            if (decode_ip4(pkt, after_eth, after_len) == NP_OK &&
+                after_len >= sizeof(ip4_hdr_t)) {
                 const ip4_hdr_t *ip = (const ip4_hdr_t *)after_eth;
                 uint8_t ihl = (ip->version_ihl & 0x0f) * 4;
-                if (after_len >= ihl) {
+                if (ihl >= 20 && after_len >= ihl) {
                     net_data = after_eth + ihl;
                     net_len  = after_len - ihl;
                     ip_proto = ip->protocol;
                 }
             }
         } else if (et == 0x86DD) {
-            decode_ip6(pkt, after_eth, after_len);
-            if (after_len >= sizeof(ip6_hdr_t)) {
+            if (decode_ip6(pkt, after_eth, after_len) == NP_OK &&
+                after_len >= sizeof(ip6_hdr_t)) {
                 const ip6_hdr_t *ip6 = (const ip6_hdr_t *)after_eth;
                 const uint8_t *xdata = after_eth + sizeof(ip6_hdr_t);
                 size_t         xlen  = after_len - sizeof(ip6_hdr_t);
@@ -759,19 +761,20 @@ np_err_t np_demux_packet(np_packet_t *pkt, np_linktype_t linktype)
         const uint8_t *after_eth = data + 16;
         size_t         after_len = len  - 16;
         if (et == 0x0800) {
-            decode_ip4(pkt, after_eth, after_len);
-            if (after_len >= sizeof(ip4_hdr_t)) {
+            /* Bug M3 fix: check decode_ip4 return. */
+            if (decode_ip4(pkt, after_eth, after_len) == NP_OK &&
+                after_len >= sizeof(ip4_hdr_t)) {
                 const ip4_hdr_t *ip = (const ip4_hdr_t *)after_eth;
                 uint8_t ihl = (ip->version_ihl & 0x0f) * 4;
-                if (after_len >= ihl) {
+                if (ihl >= 20 && after_len >= ihl) {
                     net_data = after_eth + ihl;
                     net_len  = after_len - ihl;
                     ip_proto = ip->protocol;
                 }
             }
         } else if (et == 0x86DD) {
-            decode_ip6(pkt, after_eth, after_len);
-            if (after_len >= sizeof(ip6_hdr_t)) {
+            if (decode_ip6(pkt, after_eth, after_len) == NP_OK &&
+                after_len >= sizeof(ip6_hdr_t)) {
                 const ip6_hdr_t *ip6 = (const ip6_hdr_t *)after_eth;
                 const uint8_t *xdata = after_eth + sizeof(ip6_hdr_t);
                 size_t         xlen  = after_len - sizeof(ip6_hdr_t);
@@ -790,18 +793,20 @@ np_err_t np_demux_packet(np_packet_t *pkt, np_linktype_t linktype)
         if (len >= sizeof(ip4_hdr_t)) {
             uint8_t ver = (data[0] >> 4) & 0x0f;
             if (ver == 4) {
-                decode_ip4(pkt, data, len);
-                const ip4_hdr_t *ip = (const ip4_hdr_t *)data;
-                uint8_t ihl = (ip->version_ihl & 0x0f) * 4;
-                if (len >= ihl) {
-                    net_data = data + ihl;
-                    net_len  = len  - ihl;
-                    ip_proto = ip->protocol;
+                /* Bug M3 fix: check decode_ip4 return. */
+                if (decode_ip4(pkt, data, len) == NP_OK) {
+                    const ip4_hdr_t *ip = (const ip4_hdr_t *)data;
+                    uint8_t ihl = (ip->version_ihl & 0x0f) * 4;
+                    if (ihl >= 20 && len >= ihl) {
+                        net_data = data + ihl;
+                        net_len  = len  - ihl;
+                        ip_proto = ip->protocol;
+                    }
                 }
             } else if (ver == 6) {
-                decode_ip6(pkt, data, len);
-                const ip6_hdr_t *ip6 = (const ip6_hdr_t *)data;
-                if (len >= sizeof(ip6_hdr_t)) {
+                if (decode_ip6(pkt, data, len) == NP_OK &&
+                    len >= sizeof(ip6_hdr_t)) {
+                    const ip6_hdr_t *ip6 = (const ip6_hdr_t *)data;
                     const uint8_t *xdata = data + sizeof(ip6_hdr_t);
                     size_t         xlen  = len  - sizeof(ip6_hdr_t);
                     ipv6_skip_ext_headers(ip6->next_header, xdata, xlen,

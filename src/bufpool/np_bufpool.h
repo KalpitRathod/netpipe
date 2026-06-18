@@ -30,7 +30,9 @@ typedef struct np_buf {
     size_t          size;      /* bytes currently used                 */
     size_t          capacity;  /* bytes allocated                      */
 
-    /* reference counting */
+    /* reference counting — protected by reflock.  Caller must hold a
+     * reference before calling np_buf_ref; assert(refcount > 0) guards
+     * against misuse (Bug C6 fix). */
     int             refcount;
     pthread_mutex_t reflock;
 
@@ -40,7 +42,16 @@ typedef struct np_buf {
     /* intrusive free-list link (valid only when refcount == 0)        */
     struct np_buf  *next_free;
 
-    /* the actual storage immediately follows this struct in memory    */
+    /* Slab-membership markers (Bug BUF-05 fix).  is_slab=true only for
+     * buffers allocated from pool->slab; heap-overflow buffers have
+     * is_slab=false so they always take the free() path on unref.
+     * magic is a sentinel value (NP_BUF_MAGIC) set at slab creation. */
+    bool            is_slab;
+    uint32_t        magic;
+
+    /* the actual storage immediately follows this struct in memory.
+     * Do NOT copy np_buf_t by value — use np_buf_ref().  sizeof(np_buf_t)
+     * does NOT include any _storage bytes. */
     uint8_t         _storage[];
 } np_buf_t;
 

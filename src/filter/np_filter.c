@@ -109,7 +109,9 @@ static bool port_match(np_filter_t *f, const np_packet_t *pkt)
     const uint8_t *d = pkt->transport->data;
     size_t          l = pkt->transport->len;
 
-    if (l < 4) return false;
+    /* Bug F1 fix: guard against NULL data.  A demuxer bug or a
+     * hand-constructed packet could set len >= 4 with data == NULL. */
+    if (!d || l < 4) return false;
     uint16_t sp = (uint16_t)((d[0] << 8) | d[1]);
     uint16_t dp = (uint16_t)((d[2] << 8) | d[3]);
     return sp == p->port || dp == p->port;
@@ -138,7 +140,8 @@ static bool host_match(np_filter_t *f, const np_packet_t *pkt)
     if (!pkt->net || pkt->net->proto != NP_PROTO_IP4) return false;
 
     const uint8_t *ip = pkt->net->data;
-    if (pkt->net->len < 20) return false;
+    /* Bug F1 fix: guard against NULL data. */
+    if (!ip || pkt->net->len < 20) return false;
 
     uint32_t src = ((uint32_t)ip[12] << 24) | ((uint32_t)ip[13] << 16) | ((uint32_t)ip[14] << 8) | ip[15];
     uint32_t dst = ((uint32_t)ip[16] << 24) | ((uint32_t)ip[17] << 16) | ((uint32_t)ip[18] << 8) | ip[19];
@@ -234,5 +237,13 @@ np_filter_t *np_filter_not(np_filter_t *a)
 
 void np_filter_free(np_filter_t *f)
 {
-    if (f && f->ops && f->ops->free) f->ops->free(f);
+    /* Bug F2 fix: previously, if `f->ops->free` was NULL, the filter
+     * struct itself was never freed, leaking it.  Now we fall through
+     * to a plain free() in that case. */
+    if (f && f->ops && f->ops->free) {
+        f->ops->free(f);
+    } else if (f) {
+        free(f->priv);
+        free(f);
+    }
 }

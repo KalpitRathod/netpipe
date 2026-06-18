@@ -11,6 +11,7 @@
 #include "../log/np_log.h"
 
 #define FLOW_BUCKETS 1024
+#define FLOW_MAX_ENTRIES 1000000   /* Bug FT2 fix: hard cap against SYN-flood OOM */
 
 #pragma pack(push, 1)
 
@@ -79,8 +80,9 @@ typedef struct {
     uint64_t bytes_l2h;
     uint64_t pkts_h2l;
     uint64_t bytes_h2l;
-    struct timespec first_seen;
-    struct timespec last_seen;
+    struct timespec first_seen;        /* capture timestamp (pkt->ts) — display only */
+    struct timespec first_seen_wall;   /* Bug FT3 fix: wall-clock first-seen, for duration */
+    struct timespec last_seen;         /* wall-clock last-seen (CLOCK_REALTIME) */
     uint8_t tcp_flags_seen;
 } flow_stats_t;
 
@@ -95,6 +97,7 @@ typedef struct {
     pthread_mutex_t lock;
     uint64_t        total_flows;
     uint64_t        sweep_counter;   /* for periodic GC (Bug 2.1) */
+    uint64_t        flows_dropped;   /* Bug FT2 fix: count flows rejected due to cap */
 } flow_tracker_ctx_t;
 
 #define FLOW_IDLE_TIMEOUT_S   60   /* evict flows idle > 60 s */
@@ -176,6 +179,8 @@ static void flow_tracker_free(np_processor_t *p)
     flow_tracker_ctx_t *ctx = p->priv;
     if (!ctx) return;
 
+    pthread_mutex_lock(&ctx->lock);
+
     /* Print a gorgeous summary table of all tracked flows */
     printf("\n%s", "\033[1m=========================================================================================================\033[0m\n");
     printf("%s", "                                        \033[1;36mFLOW TRACKER SUMMARY\033[0m\n");
@@ -204,8 +209,13 @@ static void flow_tracker_free(np_processor_t *p)
             snprintf(pkts_str, sizeof(pkts_str), "%lu/%lu", (unsigned long)node->stats.pkts_l2h, (unsigned long)node->stats.pkts_h2l);
             snprintf(bytes_str, sizeof(bytes_str), "%s/%s", bytes_lh_str, bytes_hl_str);
 
-            double duration = (double)(node->stats.last_seen.tv_sec - node->stats.first_seen.tv_sec) +
-                              (double)(node->stats.last_seen.tv_nsec - node->stats.first_seen.tv_nsec) / 1000000000.0;
+            /* Bug FT3 fix: use wall-clock for both endpoints of the
+             * duration calculation.  Using capture-timestamp for
+             * first_seen and wall-clock for last_seen produced
+             * multi-year "durations" on pcap replay. */
+            double duration = (double)(node->stats.last_seen.tv_sec - node->stats.first_seen_wall.tv_sec) +
+                              (double)(node->stats.last_seen.tv_nsec - node->stats.first_seen_wall.tv_nsec) / 1000000000.0;
+            if (duration < 0) duration = 0;
 
             const char *proto_name = (node->key.proto == IPPROTO_TCP) ? "TCP" :
                                      (node->key.proto == IPPROTO_UDP) ? "UDP" : "IP";
@@ -225,11 +235,19 @@ static void flow_tracker_free(np_processor_t *p)
             free(node);
             node = next;
         }
+        ctx->buckets[i] = NULL;
     }
 
     printf("%s", "=========================================================================================================\n");
-    printf("Total tracked flows: \033[1;32m%lu\033[0m\n\n", (unsigned long)ctx->total_flows);
+    printf("Total tracked flows: \033[1;32m%lu\033[0m",
+           (unsigned long)ctx->total_flows);
+    if (ctx->flows_dropped > 0) {
+        printf("  (\033[1;31m%lu dropped due to %d-entry cap\033[0m)",
+               (unsigned long)ctx->flows_dropped, FLOW_MAX_ENTRIES);
+    }
+    printf("\n\n");
 
+    pthread_mutex_unlock(&ctx->lock);
     pthread_mutex_destroy(&ctx->lock);
     free(ctx);
     free(p);
@@ -238,8 +256,26 @@ static void flow_tracker_free(np_processor_t *p)
 static np_err_t flow_tracker_process(np_processor_t *p, np_packet_t *pkt)
 {
     flow_tracker_ctx_t *ctx = p->priv;
-    if (!ctx || !pkt->net) {
+    if (!ctx || !pkt->net || !pkt->net->data) {
         return NP_OK;
+    }
+
+    /* Bug FT1 fix: bounds-check the network + transport layers BEFORE
+     * casting their data pointers to packed-struct headers.  A malformed
+     * packet (or a demuxer that sets len shorter than the struct) would
+     * otherwise trigger an out-of-bounds read. */
+    if (pkt->net->proto == NP_PROTO_IP4) {
+        if (pkt->net->len < sizeof(ip4_hdr_t)) return NP_OK;
+    } else if (pkt->net->proto == NP_PROTO_IP6) {
+        if (pkt->net->len < sizeof(ip6_hdr_t)) return NP_OK;
+    } else {
+        return NP_OK;
+    }
+    if (pkt->transport && pkt->transport->data) {
+        if (pkt->transport->proto == NP_PROTO_TCP &&
+            pkt->transport->len < sizeof(tcp_hdr_t)) return NP_OK;
+        if (pkt->transport->proto == NP_PROTO_UDP &&
+            pkt->transport->len < sizeof(udp_hdr_t)) return NP_OK;
     }
 
     flow_key_t key;
@@ -247,10 +283,6 @@ static np_err_t flow_tracker_process(np_processor_t *p, np_packet_t *pkt)
 
     bool is_ipv4 = (pkt->net->proto == NP_PROTO_IP4);
     bool is_ipv6 = (pkt->net->proto == NP_PROTO_IP6);
-
-    if (!is_ipv4 && !is_ipv6) {
-        return NP_OK;
-    }
 
     uint16_t src_port = 0;
     uint16_t dst_port = 0;
@@ -291,7 +323,12 @@ static np_err_t flow_tracker_process(np_processor_t *p, np_packet_t *pkt)
                 proto_val = ip6->next_header;  /* ICMPv6, etc. */
             }
         } else {
-            proto_val = ip6->next_header;
+            /* Bug FT4 fix: when there is no transport layer (e.g.
+             * fragmented IPv6 packet whose L4 header isn't in this
+             * fragment), proto_val would be set to the extension
+             * header type (e.g. 44 = Fragment Header), splitting one
+             * flow into many.  Skip these packets entirely. */
+            return NP_OK;
         }
 
         struct in6_addr src_ip, dst_ip;
@@ -405,6 +442,13 @@ static np_err_t flow_tracker_process(np_processor_t *p, np_packet_t *pkt)
         }
     }
 
+    /* Bug FT2 fix: hard cap on total flows.  Under a SYN flood with
+     * random source IPs, new flows are created faster than the
+     * per-bucket sweep can evict them (the sweep only touches 1/1024
+     * of buckets per packet).  Without a cap, the table grows until
+     * OOM.  When the cap is hit, we trigger an immediate FULL sweep
+     * across all buckets; if that doesn't free enough, we drop the
+     * new flow (counted for stats) and continue. */
     flow_node_t *node = ctx->buckets[bucket];
     while (node) {
         if (flow_key_match(&node->key, &key)) {
@@ -414,6 +458,32 @@ static np_err_t flow_tracker_process(np_processor_t *p, np_packet_t *pkt)
     }
 
     if (!node) {
+        if (ctx->total_flows >= FLOW_MAX_ENTRIES) {
+            /* Emergency full sweep */
+            time_t now_sec = time(NULL);
+            for (int i = 0; i < FLOW_BUCKETS; i++) {
+                flow_node_t **pp = &ctx->buckets[i];
+                while (*pp) {
+                    flow_node_t *n = *pp;
+                    double age = difftime(now_sec, n->stats.last_seen.tv_sec);
+                    if (age > (double)FLOW_IDLE_TIMEOUT_S) {
+                        *pp = n->next;
+                        free(n);
+                        ctx->total_flows--;
+                    } else {
+                        pp = &n->next;
+                    }
+                }
+            }
+        }
+
+        if (ctx->total_flows >= FLOW_MAX_ENTRIES) {
+            /* Still at cap after sweep — drop the new flow rather than OOM. */
+            ctx->flows_dropped++;
+            pthread_mutex_unlock(&ctx->lock);
+            return NP_OK;
+        }
+
         node = calloc(1, sizeof(*node));
         if (!node) {
             pthread_mutex_unlock(&ctx->lock);
@@ -421,6 +491,7 @@ static np_err_t flow_tracker_process(np_processor_t *p, np_packet_t *pkt)
         }
         node->key = key;
         node->stats.first_seen = pkt->ts;
+        clock_gettime(CLOCK_REALTIME, &node->stats.first_seen_wall);
         node->next = ctx->buckets[bucket];
         ctx->buckets[bucket] = node;
         ctx->total_flows++;
@@ -443,7 +514,7 @@ static np_err_t flow_tracker_process(np_processor_t *p, np_packet_t *pkt)
      * prevented eviction on live captures when traffic stopped.
      * first_seen is kept as pkt->ts for reporting purposes (it's the
      * packet's actual capture time, which is what users expect to see
-     * in flow summaries). */
+     * in flow summaries).  first_seen_wall is used for duration math. */
     clock_gettime(CLOCK_REALTIME, &node->stats.last_seen);
     if (is_low_to_high) {
         node->stats.pkts_l2h++;

@@ -57,15 +57,45 @@ static np_err_t common_next(np_source_t *src, np_packet_t **out)
     const u_char       *data;
 
     int rc = pcap_next_ex(p->handle, &hdr, &data);
-    if (rc == PCAP_ERROR_BREAK || rc == PCAP_ERROR || rc == -2) {
+    /* Bug H8 fix: distinguish end-of-stream from real I/O errors.
+     *
+     * libpcap return codes for pcap_next_ex:
+     *   1                  — success (packet read)
+     *   0                  — timeout on live capture (no packet in time)
+     *   PCAP_ERROR_BREAK   — pcap_breakloop was called (treat as EOF)
+     *   PCAP_ERROR (-1)    — generic error (read error, interface went
+     *                        down, savefile truncated, etc.)
+     *   -2                 — end of savefile (EOF on offline pcap)
+     *
+     * The OLD code lumped PCAP_ERROR in with PCAP_ERROR_BREAK/-2 as
+     * NP_ERR_EOF, which caused the pipeline to silently stop on
+     * transient errors (e.g. a temporary network hiccup on a live
+     * capture) instead of reporting them.  Now only PCAP_ERROR_BREAK
+     * and -2 (which IS PCAP_ERROR_BREAK in libpcap) map to EOF; a real
+     * PCAP_ERROR maps to NP_ERR_IO and is logged. */
+    if (rc == PCAP_ERROR_BREAK || rc == -2) {
         return NP_ERR_EOF;
+    }
+    if (rc == PCAP_ERROR) {
+        NP_LOG_ERROR("pcap source: read error: %s", pcap_geterr(p->handle));
+        return NP_ERR_IO;
     }
     if (rc == 0) return NP_ERR_TIMEOUT; /* timeout, caller will retry */
 
+    /* Bug SP2 fix: validate that np_packet_alloc actually returned a
+     * packet with a non-NULL raw pointer before memcpy.  A partial
+     * allocation (malloc succeeds for the header but fails for raw)
+     * could leave raw == NULL with caplen > 0. */
     np_packet_t *pkt = np_packet_alloc(hdr->caplen);
     if (!pkt) return NP_ERR_NOMEM;
+    if (hdr->caplen > 0 && !pkt->raw) {
+        np_packet_free(pkt);
+        return NP_ERR_NOMEM;
+    }
 
-    memcpy(pkt->raw, data, hdr->caplen);
+    if (hdr->caplen > 0) {
+        memcpy(pkt->raw, data, hdr->caplen);
+    }
     pkt->caplen  = hdr->caplen;
     pkt->wirelen = hdr->len;
     pkt->ts.tv_sec  = hdr->ts.tv_sec;

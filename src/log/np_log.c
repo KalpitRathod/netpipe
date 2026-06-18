@@ -66,18 +66,34 @@ void _np_log(np_log_level_t level,
              const char *file, int line, const char *func,
              const char *fmt, ...)
 {
-    if (level < g_log.level) return;
+    /* Bug L1 fix: bounds-check the level before indexing the static
+     * arrays.  A misuse of the macro (e.g. casting a random int to
+     * np_log_level_t) would otherwise read off the end of level_str
+     * / level_col. */
+    static const int n_levels = (int)(sizeof(level_str)/sizeof(level_str[0]));
+    if (level < 0 || level >= n_levels) return;
 
+    /* Bug L4 fix: ensure g_log is initialized BEFORE we read
+     * g_log.level.  The old code read level first, then called
+     * pthread_once — a data race if another thread was concurrently
+     * calling np_log_set_level before any log call had run. */
     pthread_once(&g_once, log_init_once);
+
+    if (level < g_log.level) return;
 
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     struct tm tm;
-    localtime_r(&ts.tv_sec, &tm);
     char timebuf[32];
-    snprintf(timebuf, sizeof(timebuf), "%02d:%02d:%02d.%06ld",
-             tm.tm_hour, tm.tm_min, tm.tm_sec,
-             (long)(ts.tv_nsec / 1000));
+    /* Bug L2 fix: check localtime_r return — on failure (e.g. negative
+     * tv_sec) it returns NULL and tm is left uninitialized. */
+    if (!localtime_r(&ts.tv_sec, &tm)) {
+        snprintf(timebuf, sizeof(timebuf), "??:??:??.??????");
+    } else {
+        snprintf(timebuf, sizeof(timebuf), "%02d:%02d:%02d.%06ld",
+                 tm.tm_hour, tm.tm_min, tm.tm_sec,
+                 (long)(ts.tv_nsec / 1000));
+    }
 
     /* Extract only the basename for brevity */
     const char *base = strrchr(file, '/');

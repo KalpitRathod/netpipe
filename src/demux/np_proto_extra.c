@@ -84,23 +84,27 @@ static bool looks_like_sip(const uint8_t *p, size_t len,
                             uint16_t sp, uint16_t dp)
 {
     if (sp != PORT_SIP && dp != PORT_SIP) return false;
-    if (len < 8) return false;
-    /* Request methods */
-    if (memcmp(p, "INVITE ",     7) == 0) return true;
-    if (memcmp(p, "ACK ",        4) == 0) return true;
-    if (memcmp(p, "BYE ",        4) == 0) return true;
-    if (memcmp(p, "CANCEL ",     7) == 0) return true;
-    if (memcmp(p, "REGISTER ",   9) == 0) return true;
-    if (memcmp(p, "OPTIONS ",    8) == 0) return true;
-    if (memcmp(p, "PRACK ",      6) == 0) return true;
-    if (memcmp(p, "SUBSCRIBE ", 10) == 0) return true;
-    if (memcmp(p, "NOTIFY ",     7) == 0) return true;
-    if (memcmp(p, "PUBLISH ",    8) == 0) return true;
-    if (memcmp(p, "INFO ",       5) == 0) return true;
-    if (memcmp(p, "REFER ",      6) == 0) return true;
-    if (memcmp(p, "MESSAGE ",    8) == 0) return true;
+    /* Bug H4 fix: the old code only checked `len < 8` but then did
+     * 9- and 10-byte memcmp calls (REGISTER, SUBSCRIBE).  For UDP
+     * payloads of length 8 or 9, those memcmps would read 1-2 bytes
+     * past the end of the payload — a buffer over-read.  Guard each
+     * memcmp with its own length check so we never read past `len`. */
+    /* Request methods (each guarded by its own length) */
+    if (len >= 7  && memcmp(p, "INVITE ",     7) == 0) return true;
+    if (len >= 4  && memcmp(p, "ACK ",        4) == 0) return true;
+    if (len >= 4  && memcmp(p, "BYE ",        4) == 0) return true;
+    if (len >= 7  && memcmp(p, "CANCEL ",     7) == 0) return true;
+    if (len >= 9  && memcmp(p, "REGISTER ",   9) == 0) return true;
+    if (len >= 8  && memcmp(p, "OPTIONS ",    8) == 0) return true;
+    if (len >= 6  && memcmp(p, "PRACK ",      6) == 0) return true;
+    if (len >= 10 && memcmp(p, "SUBSCRIBE ", 10) == 0) return true;
+    if (len >= 7  && memcmp(p, "NOTIFY ",     7) == 0) return true;
+    if (len >= 8  && memcmp(p, "PUBLISH ",    8) == 0) return true;
+    if (len >= 5  && memcmp(p, "INFO ",       5) == 0) return true;
+    if (len >= 6  && memcmp(p, "REFER ",      6) == 0) return true;
+    if (len >= 8  && memcmp(p, "MESSAGE ",    8) == 0) return true;
     /* Response */
-    if (memcmp(p, "SIP/2.0 ",    8) == 0) return true;
+    if (len >= 8  && memcmp(p, "SIP/2.0 ",    8) == 0) return true;
     return false;
 }
 

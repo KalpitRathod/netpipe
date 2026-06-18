@@ -145,27 +145,37 @@ const np_sink_desc_t *np_registry_find_sink_by_ext(const char *ext)
 /*  Listing                                                             */
 /* ------------------------------------------------------------------ */
 
+/* Bug R1 fix: take the registry lock before walking the linked lists.
+ * A concurrent __attribute__((constructor)) (or any thread calling
+ * np_registry_add_*) could otherwise mutate the list while we're
+ * walking the ->next pointers, causing a data race / segfault. */
 void np_registry_list_sources(void)
 {
+    pthread_mutex_lock(&g_reg.lock);
     printf("\033[1mRegistered sources:\033[0m\n");
     for (np_source_desc_t *d = g_reg.sources; d; d = d->next)
         printf("  \033[36m%-20s\033[0m  %s\n", d->name,
                d->long_name ? d->long_name : "");
+    pthread_mutex_unlock(&g_reg.lock);
 }
 
 void np_registry_list_sinks(void)
 {
+    pthread_mutex_lock(&g_reg.lock);
     printf("\033[1mRegistered sinks:\033[0m\n");
     for (np_sink_desc_t *d = g_reg.sinks; d; d = d->next)
         printf("  \033[36m%-20s\033[0m  %s  [.%s]\n", d->name,
                d->long_name  ? d->long_name  : "",
                d->extensions ? d->extensions : "—");
+    pthread_mutex_unlock(&g_reg.lock);
 }
 
 void np_registry_list_filters(void)
 {
+    pthread_mutex_lock(&g_reg.lock);
     printf("\033[1mRegistered filters:\033[0m\n");
     for (np_filter_desc_t *d = g_reg.filters; d; d = d->next)
         printf("  \033[36m%-20s\033[0m  %s\n", d->name,
                d->long_name ? d->long_name : "");
+    pthread_mutex_unlock(&g_reg.lock);
 }

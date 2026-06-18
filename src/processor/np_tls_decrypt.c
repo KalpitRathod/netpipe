@@ -57,11 +57,13 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <time.h>
+#include <pthread.h>
 
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/kdf.h>
 #include <openssl/sha.h>
+#include <openssl/crypto.h>   /* Bug TLS-DEC-06 fix: OPENSSL_cleanse */
 
 #include "netpipe.h"
 #include "../pipeline/np_pipeline.h"
@@ -202,6 +204,7 @@ typedef struct {
     tls_keylog_t  keylog;
     tls_flow_t   *flows[TLS_FLOW_BUCKETS];
     int           nflows;
+    pthread_mutex_t lock;   /* Bug M5 fix: protect flows[] + nflows */
 
     /* Global stats. */
     uint64_t      stat_total_packets;
@@ -287,6 +290,10 @@ static void keylog_free(tls_keylog_t *kl)
         tls_keyrec_t *r = kl->buckets[i];
         while (r) {
             tls_keyrec_t *next = r->next;
+            /* Bug TLS-DEC-06 fix: wipe the secret before freeing so it
+             * doesn't linger in freed heap memory.  The client_random
+             * is not secret so we don't bother cleansing it. */
+            OPENSSL_cleanse(r->secret, sizeof(r->secret));
             free(r);
             r = next;
         }
@@ -560,6 +567,12 @@ static void aead_key_free(tls_aead_key_t *k)
         EVP_CIPHER_CTX_free(k->ctx);
         k->ctx = NULL;
     }
+    /* Bug TLS-DEC-06 fix: wipe the key + IV material before marking
+     * the slot un-ready.  Without this, the key bytes linger in heap
+     * memory until the slot is reused or the process exits. */
+    OPENSSL_cleanse(k->key, sizeof(k->key));
+    OPENSSL_cleanse(k->iv, sizeof(k->iv));
+    OPENSSL_cleanse(k->implicit_iv, sizeof(k->implicit_iv));
     k->ready = false;
 }
 
@@ -927,18 +940,30 @@ static uint32_t canonical_flow_key(const np_packet_t *pkt)
 
 static tls_flow_t *flow_lookup_or_create(tls_decrypt_ctx_t *ctx, uint32_t flow_id)
 {
+    /* Bug M5 fix: take the context lock so two threads processing
+     * packets on the same flow cannot both miss the lookup and insert
+     * duplicate flow entries.  The lock is held briefly — just the
+     * hash walk + (maybe) a calloc + link. */
     uint32_t h = flow_id & (TLS_FLOW_BUCKETS - 1);
+    pthread_mutex_lock(&ctx->lock);
     tls_flow_t *f = ctx->flows[h];
     while (f) {
-        if (f->flow_id == flow_id) return f;
+        if (f->flow_id == flow_id) {
+            pthread_mutex_unlock(&ctx->lock);
+            return f;
+        }
         f = f->next;
     }
     f = calloc(1, sizeof(*f));
-    if (!f) return NULL;
+    if (!f) {
+        pthread_mutex_unlock(&ctx->lock);
+        return NULL;
+    }
     f->flow_id = flow_id;
     f->next = ctx->flows[h];
     ctx->flows[h] = f;
     ctx->nflows++;
+    pthread_mutex_unlock(&ctx->lock);
     return f;
 }
 
@@ -1010,6 +1035,16 @@ static bool extract_server_hello(const uint8_t *record, size_t len,
     }
     size_t sid_off = TLS_HDR_LEN + 4 + 2 + 32;
     uint8_t sid_len = frag[sid_off - TLS_HDR_LEN];
+    /* Bug TLS-DEC-03 fix: validate sid_len.  RFC 5246 §7.4.1.2 limits
+     * the session_id to 32 bytes.  A malformed or attacker-crafted
+     * ServerHello with sid_len = 255 would cause us to read the
+     * cipher-suite bytes from the wrong offset (inside extension data
+     * rather than right after the session_id), producing a bogus
+     * cipher suite and silently failing every subsequent AEAD auth. */
+    if (sid_len > 32) {
+        NP_LOG_DEBUG("tls_decrypt: ServerHello sid_len=%u > 32, rejecting", sid_len);
+        return false;
+    }
     size_t cipher_off = sid_off + 1 + sid_len;
     if (len < cipher_off + 2) return false;
     uint16_t cipher = ((uint16_t)frag[cipher_off - TLS_HDR_LEN] << 8) |
@@ -1121,9 +1156,29 @@ static np_err_t tls_process(np_processor_t *p, np_packet_t *pkt)
     /* A single TCP segment may carry multiple TLS records (e.g. the
      * server's first flight: ServerHello + several encrypted handshake
      * records all in one segment).  Walk through every record in the
-     * TLS layer so we don't miss any. */
-    const uint8_t *buf     = pkt->app->data;
-    size_t         buf_len = pkt->app->len;
+     * TLS layer so we don't miss any.
+     *
+     * Bug H9 fix: prefer pkt->stream_data (the reassembled TCP stream)
+     * over pkt->app->data (the per-packet view).  When a TLS record
+     * spans multiple TCP segments (e.g. the server's Certificate flight,
+     * often 3-10 KB), pkt->app->data only sees the first fragment and
+     * the record-walk loop bails out on the truncated-record check.
+     * Using stream_data lets us decrypt records that crossed segment
+     * boundaries — which is the whole point of doing reassembly. */
+    const uint8_t *buf     = NULL;
+    size_t         buf_len = 0;
+    bool used_stream = false;
+    if (pkt->stream_data && pkt->stream_len > 0) {
+        buf     = pkt->stream_data;
+        buf_len = pkt->stream_len;
+        used_stream = true;
+    } else if (pkt->app && pkt->app->data && pkt->app->len > 0) {
+        buf     = pkt->app->data;
+        buf_len = pkt->app->len;
+    } else {
+        /* No data to decrypt — nothing to do. */
+        return NP_OK;
+    }
     size_t         offset  = 0;
 
     /* Choose direction.
@@ -1383,9 +1438,21 @@ static np_err_t tls_process(np_processor_t *p, np_packet_t *pkt)
 
     free(plaintext);
 
-    /* If we decrypted any plaintext, expose it on the packet. */
+    /* If we decrypted any plaintext, expose it on the packet.
+     *
+     * Bug H9 follow-up: if we read from pkt->stream_data, we MUST NOT
+     * free it before allocating the new accumulated buffer, because
+     * `buf` aliases it (and we may still be reading from `buf` in the
+     * loop above — though by here the loop has exited).  We allocate
+     * the new buffer first, then free the old one.  If allocation
+     * fails we keep the old stream_data intact so downstream still
+     * sees the (encrypted) reassembled stream. */
     if (accumulated_len > 0) {
-        free(pkt->stream_data);
+        /* accumulated is already a fresh malloc'd buffer, so we can
+         * safely free pkt->stream_data and replace. */
+        if (used_stream && pkt->stream_data) {
+            free(pkt->stream_data);
+        }
         pkt->stream_data = accumulated;
         pkt->stream_len  = accumulated_len;
 
@@ -1399,6 +1466,8 @@ static np_err_t tls_process(np_processor_t *p, np_packet_t *pkt)
         }
     } else {
         free(accumulated);
+        /* Don't touch pkt->stream_data — leave it as the reassembler
+         * set it.  Downstream can still see the (encrypted) stream. */
     }
 
     return NP_OK;
@@ -1410,6 +1479,7 @@ static void tls_free(np_processor_t *p)
     if (!ctx) { free(p); return; }
     keylog_free(&ctx->keylog);
     flow_free_chain(ctx);
+    pthread_mutex_destroy(&ctx->lock);
     free(ctx);
     free(p);
 }
@@ -1426,6 +1496,12 @@ np_processor_t *np_processor_tls_decrypt(const char *keylog_path)
     if (!p) return NULL;
     tls_decrypt_ctx_t *ctx = calloc(1, sizeof(*ctx));
     if (!ctx) { free(p); return NULL; }
+    /* Bug M5 fix: initialize the context mutex. */
+    if (pthread_mutex_init(&ctx->lock, NULL) != 0) {
+        free(ctx);
+        free(p);
+        return NULL;
+    }
     if (keylog_path) {
         keylog_load(&ctx->keylog, keylog_path);
     }

@@ -94,6 +94,19 @@ static np_err_t ring_src_next(np_source_t *src, np_packet_t **out)
         }
     }
 
+    /* Bug H7 fix: TPACKET_V2 requires a read memory barrier between
+     * reading tp_status == TP_STATUS_USER and reading any other field
+     * of the tpacket2_hdr (tp_mac, tp_snaplen, tp_sec, tp_nsec) or
+     * the packet data itself.  Without the barrier, on weakly-ordered
+     * CPUs (ARM, POWER), the compiler/CPU may reorder the subsequent
+     * reads before the tp_status read, observing stale data from a
+     * previous frame.  The kernel documents this requirement in
+     * Documentation/networking/packet_mmap.rst.
+     *
+     * __sync_synchronize() is a full memory barrier; on x86 it
+     * compiles to `mfence`, on ARM to `dmb ish`. */
+    __sync_synchronize();
+
     // Zero-copy capture achieved: packet data is already in mapped buffer.
     // Allocate pipeline packet to copy/forward the data.
     np_packet_t *pkt = np_packet_alloc(hdr->tp_snaplen);

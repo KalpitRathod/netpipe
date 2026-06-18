@@ -18,6 +18,15 @@
 
 np_packet_t *np_packet_alloc(size_t caplen)
 {
+    /* Bug PKT-03 fix: reject caplen > UINT32_MAX up front so the
+     * cast to uint32_t below doesn't silently truncate.  pkt->raw
+     * would be allocated at full size but pkt->caplen would record
+     * only the low 32 bits, causing downstream bounds checks to use
+     * the wrong value. */
+    if (caplen > UINT32_MAX) {
+        NP_LOG_ERROR("np_packet_alloc: caplen %zu > UINT32_MAX, rejecting", caplen);
+        return NULL;
+    }
     np_packet_t *pkt = calloc(1, sizeof(*pkt));
     if (!pkt) return NULL;
 
@@ -59,22 +68,28 @@ np_packet_t *np_packet_clone(const np_packet_t *src)
      * which produces a wild pointer if data doesn't point into raw.
      * We now validate that data is within [raw, raw+caplen) before
      * rebasing; if it's not (e.g. redirected by TLS decrypt), we
-     * set the clone's layer data to NULL to avoid a dangling pointer. */
+     * set the clone's layer data to NULL to avoid a dangling pointer.
+     *
+     * Bug PKT-01 fix: also zero out the layer's len when we set data
+     * to NULL, so downstream code that does `if (len > 0) use(data)`
+     * doesn't dereference NULL.  Previously the original len was
+     * kept, leading to NULL derefs after cloning a TLS-decrypted pkt. */
     dst->nlayers = src->nlayers;
     for (int i = 0; i < src->nlayers; i++) {
         dst->layers[i].proto   = src->layers[i].proto;
-        dst->layers[i].len     = src->layers[i].len;
         const uint8_t *sd = src->layers[i].data;
-        if (sd >= src->raw && sd < src->raw + src->caplen) {
+        /* Bug PKT-02 fix: guard against NULL sd (relational comparison
+         * of NULL with a non-NULL pointer is UB per C11 §6.5.8). */
+        if (sd != NULL && sd >= src->raw && sd < src->raw + src->caplen) {
             /* Normal case: layer data points into raw buffer. */
             ptrdiff_t off = sd - src->raw;
             dst->layers[i].data = dst->raw + off;
+            dst->layers[i].len  = src->layers[i].len;
         } else {
             /* Layer data was redirected (e.g. TLS plaintext) or is NULL.
-             * Don't rebase — set to NULL so callers don't dereference
-             * a dangling pointer.  The stream_data copy below carries
-             * the actual payload. */
+             * Set both data AND len to 0 so callers don't deref NULL. */
             dst->layers[i].data = NULL;
+            dst->layers[i].len  = 0;
         }
         dst->layers[i].decoded = NULL; /* scratch not cloned */
     }
@@ -128,6 +143,11 @@ np_layer_t *np_packet_push_layer(np_packet_t *pkt,
 
 void *np_packet_scratch_alloc(np_packet_t *pkt, size_t size)
 {
+    /* Bug PKT-08 fix: reject zero-size allocations.  Two consecutive
+     * scratch_alloc(0) calls would return the same pointer (the
+     * current scratch_used offset), which is correct C but confusing
+     * for callers that compare pointers.  Return NULL instead. */
+    if (size == 0) return NULL;
     size_t remaining = sizeof(pkt->scratch) - pkt->scratch_used;
     if (size > remaining) {
         /* Log when the scratch allocator is exhausted so the user knows
@@ -153,7 +173,14 @@ void *np_packet_scratch_alloc(np_packet_t *pkt, size_t size)
 void np_packet_ts_str(const np_packet_t *pkt, char *buf, size_t bufsz)
 {
     struct tm tm;
-    localtime_r(&pkt->ts.tv_sec, &tm);
+    /* Bug PKT-04 fix: check localtime_r return — on failure (e.g.
+     * negative tv_sec, or tv_sec out of time_t range) it returns NULL
+     * and `tm` is left uninitialized.  The old code fed uninitialized
+     * tm fields to snprintf, producing garbage timestamp strings. */
+    if (!localtime_r(&pkt->ts.tv_sec, &tm)) {
+        snprintf(buf, bufsz, "??:??:??.??????");
+        return;
+    }
     snprintf(buf, bufsz, "%02d:%02d:%02d.%06ld",
              tm.tm_hour, tm.tm_min, tm.tm_sec,
              (long)(pkt->ts.tv_nsec / 1000));
@@ -193,9 +220,15 @@ void np_packet_print(const np_packet_t *pkt, FILE *fp)
     /* hex dump of first 64 bytes */
     fprintf(fp, "│  Raw (first 64 bytes):\n│  ");
     size_t dump = pkt->caplen < 64 ? pkt->caplen : 64;
-    for (size_t i = 0; i < dump; i++) {
-        fprintf(fp, "%02x ", pkt->raw[i]);
-        if ((i + 1) % 16 == 0) fprintf(fp, "\n│  ");
+    /* Bug PKT-05 fix: guard against NULL pkt->raw — a hand-constructed
+     * or partially-freed packet could have caplen > 0 but raw == NULL. */
+    if (pkt->raw) {
+        for (size_t i = 0; i < dump; i++) {
+            fprintf(fp, "%02x ", pkt->raw[i]);
+            if ((i + 1) % 16 == 0) fprintf(fp, "\n│  ");
+        }
+    } else {
+        fprintf(fp, "<null raw buffer>");
     }
     fprintf(fp, "\n");
 

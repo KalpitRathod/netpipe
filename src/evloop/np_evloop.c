@@ -10,6 +10,27 @@
  *
  * A self-pipe (or eventfd) is used internally so np_evloop_stop()
  * can wake epoll_wait() from another thread without polling.
+ *
+ * Thread-safety
+ * ─────────────
+ * The entries table (loop->entries[]) is protected by loop->lock.
+ * All public functions that touch the table (add / del / del_timer /
+ * free) take the lock.  The run loop also takes the lock when reading
+ * the entry for a fired fd.  This makes it safe to register / cancel
+ * timers from any thread.
+ *
+ * Timer lifecycle (Bug C1 + C2 fix)
+ * ──────────────────────────────────
+ * Previously, the timer entry was marked AFTER np_evloop_add returned.
+ * If the timer fired immediately (ms=0) the dispatch ran first, freed
+ * the timer_ctx_t, and then the marking code read the freed pointer
+ * (UAF) and left a stale entry whose fd=0 (stdin) — a later
+ * del_timer would close(0) and free(NULL).
+ *
+ * Now: the entry is fully populated (is_timer=true, timer_id, timer_cb,
+ * userdata) BEFORE np_evloop_add is called, and a `dispatched` flag in
+ * timer_ctx_t prevents the double-free when a callback cancels its own
+ * timer.
  */
 
 #include <stdlib.h>
@@ -17,6 +38,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <errno.h>
+#include <pthread.h>
 #include <sys/epoll.h>
 #include <sys/timerfd.h>
 #include <sys/eventfd.h>
@@ -44,6 +66,17 @@ typedef struct np_ev_entry {
 } np_ev_entry_t;
 
 /* ------------------------------------------------------------------ */
+/*  Timer context (Bug C1+C2 fix: dispatched flag prevents double-free) */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    np_timer_cb cb;
+    void       *ud;
+    int         id;
+    bool        dispatched;  /* set by timer_dispatch before invoking cb */
+} timer_ctx_t;
+
+/* ------------------------------------------------------------------ */
 /*  Loop struct                                                         */
 /* ------------------------------------------------------------------ */
 
@@ -53,6 +86,7 @@ struct np_evloop {
 
     np_ev_entry_t *entries;       /* fd → entry map (indexed by fd)   */
     int            entries_cap;   /* capacity                         */
+    pthread_mutex_t lock;         /* protects entries[] + entries_cap */
 
     volatile bool  running;
     int            max_events;    /* epoll_wait batch size            */
@@ -65,8 +99,10 @@ struct np_evloop {
 /*  Helpers                                                             */
 /* ------------------------------------------------------------------ */
 
-static int entries_ensure(np_evloop_t *loop, int fd)
+/* Caller must hold loop->lock. */
+static int entries_ensure_locked(np_evloop_t *loop, int fd)
 {
+    if (fd < 0) return -1;
     if (fd >= loop->entries_cap) {
         int newcap = fd + 64;
         np_ev_entry_t *ne = realloc(loop->entries,
@@ -108,21 +144,35 @@ np_evloop_t *np_evloop_create(int max_events)
     np_evloop_t *loop = calloc(1, sizeof(*loop));
     if (!loop) return NULL;
 
+    if (pthread_mutex_init(&loop->lock, NULL) != 0) {
+        free(loop);
+        return NULL;
+    }
+
     loop->epfd = epoll_create1(EPOLL_CLOEXEC);
     if (loop->epfd < 0) {
         NP_LOG_ERROR("epoll_create1: %s", strerror(errno));
+        pthread_mutex_destroy(&loop->lock);
         free(loop); return NULL;
     }
 
     loop->wakefd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (loop->wakefd < 0) {
         NP_LOG_ERROR("eventfd: %s", strerror(errno));
-        close(loop->epfd); free(loop); return NULL;
+        close(loop->epfd);
+        pthread_mutex_destroy(&loop->lock);
+        free(loop); return NULL;
     }
 
-    /* Register wakefd in epoll */
+    /* Register wakefd in epoll (Bug E5 fix: check return value) */
     struct epoll_event ev = { .events = EPOLLIN, .data.fd = loop->wakefd };
-    epoll_ctl(loop->epfd, EPOLL_CTL_ADD, loop->wakefd, &ev);
+    if (epoll_ctl(loop->epfd, EPOLL_CTL_ADD, loop->wakefd, &ev) < 0) {
+        NP_LOG_ERROR("epoll_ctl(ADD wakefd): %s", strerror(errno));
+        close(loop->wakefd);
+        close(loop->epfd);
+        pthread_mutex_destroy(&loop->lock);
+        free(loop); return NULL;
+    }
 
     loop->max_events     = max_events > 0 ? max_events : 64;
     loop->ev_buf         = malloc((size_t)loop->max_events * sizeof(struct epoll_event));
@@ -141,6 +191,8 @@ np_evloop_t *np_evloop_create(int max_events)
 void np_evloop_free(np_evloop_t *loop)
 {
     if (!loop) return;
+
+    pthread_mutex_lock(&loop->lock);
     /* Bug 1 fix: close any remaining timer fds and free their contexts
      * before destroying the loop.  Previously these were leaked. */
     if (loop->entries) {
@@ -150,12 +202,19 @@ void np_evloop_free(np_evloop_t *loop)
                 close(e->fd);
                 free(e->userdata);
             }
+            e->is_timer = false;
+            e->fd = 0;
         }
     }
     if (loop->epfd   >= 0) close(loop->epfd);
     if (loop->wakefd >= 0) close(loop->wakefd);
     free(loop->ev_buf);
     free(loop->entries);
+    loop->entries = NULL;
+    loop->ev_buf  = NULL;
+    pthread_mutex_unlock(&loop->lock);
+
+    pthread_mutex_destroy(&loop->lock);
     free(loop);
 }
 
@@ -166,15 +225,39 @@ void np_evloop_free(np_evloop_t *loop)
 int np_evloop_add(np_evloop_t *loop, int fd, uint32_t events,
                    np_ev_cb cb, void *userdata)
 {
-    if (entries_ensure(loop, fd) < 0) return -1;
+    if (!loop || fd < 0) return -1;
+
+    pthread_mutex_lock(&loop->lock);
+    if (entries_ensure_locked(loop, fd) < 0) {
+        pthread_mutex_unlock(&loop->lock);
+        return -1;
+    }
 
     np_ev_entry_t *e = &loop->entries[fd];
     bool already_in  = (e->fd == fd && e->cb != NULL);
+
+    /* Stage new values in locals so we can roll back on epoll_ctl
+     * failure (Bug E4 fix: previously the entry was left in a
+     * "looks in-use but epoll doesn't know" state). */
+    int        prev_fd       = e->fd;
+    uint32_t   prev_events   = e->events;
+    np_ev_cb   prev_cb       = e->cb;
+    void      *prev_userdata = e->userdata;
+    bool       prev_is_timer = e->is_timer;
+    np_timer_cb prev_tcb     = e->timer_cb;
+    int        prev_tid      = e->timer_id;
 
     e->fd       = fd;
     e->events   = events;
     e->cb       = cb;
     e->userdata = userdata;
+    /* If the caller is re-adding an fd that previously was a timer,
+     * clear the timer markers — caller is now treating it as a regular fd. */
+    if (already_in && prev_is_timer) {
+        e->is_timer = false;
+        e->timer_cb = NULL;
+        e->timer_id = 0;
+    }
 
     struct epoll_event ev;
     ev.events  = np_to_epoll(events);
@@ -185,16 +268,31 @@ int np_evloop_add(np_evloop_t *loop, int fd, uint32_t events,
         NP_LOG_ERROR("epoll_ctl(%s, fd=%d): %s",
                      op == EPOLL_CTL_ADD ? "ADD" : "MOD",
                      fd, strerror(errno));
+        /* Roll back entry to its pre-call state. */
+        e->fd       = prev_fd;
+        e->events   = prev_events;
+        e->cb       = prev_cb;
+        e->userdata = prev_userdata;
+        e->is_timer = prev_is_timer;
+        e->timer_cb = prev_tcb;
+        e->timer_id = prev_tid;
+        pthread_mutex_unlock(&loop->lock);
         return -1;
     }
+    pthread_mutex_unlock(&loop->lock);
     return 0;
 }
 
 int np_evloop_del(np_evloop_t *loop, int fd)
 {
+    if (!loop || fd < 0) return 0;  /* Bug E7 fix: validate fd range */
+
+    pthread_mutex_lock(&loop->lock);
     epoll_ctl(loop->epfd, EPOLL_CTL_DEL, fd, NULL);
-    if (fd < loop->entries_cap)
+    if (fd < loop->entries_cap) {
         memset(&loop->entries[fd], 0, sizeof(loop->entries[fd]));
+    }
+    pthread_mutex_unlock(&loop->lock);
     return 0;
 }
 
@@ -202,30 +300,49 @@ int np_evloop_del(np_evloop_t *loop, int fd)
 /*  Timer support via timerfd                                           */
 /* ------------------------------------------------------------------ */
 
-typedef struct { np_timer_cb cb; void *ud; int id; } timer_ctx_t;
-
 static int timer_dispatch(np_evloop_t *loop, int fd,
                            uint32_t events, void *userdata)
 {
     (void)events;
     timer_ctx_t *tc = userdata;
+    if (!tc) return 0;
+
     /* drain the timerfd */
     uint64_t expirations;
     if (read(fd, &expirations, sizeof(expirations)) < 0) { /* ignore */ }
 
+    /* Bug C2 fix: mark `dispatched` BEFORE invoking the callback so
+     * that if the callback calls np_evloop_del_timer() on its own
+     * timer id, the del_timer path knows NOT to double-free. */
+    tc->dispatched = true;
     tc->cb(loop, tc->id, tc->ud);
 
-    /* one-shot: remove from epoll, close fd, free context.
+    /* One-shot: remove from epoll, close fd, free context.
      *
-     * Bug fix: the old code returned -1 to tell the run loop to call
-     * np_evloop_del(loop, fd) again — but we already deleted the entry
-     * and closed the fd here.  The run loop's np_evloop_del would then
-     * operate on a stale (already-zeroed) entry and an already-closed
-     * fd.  If the user callback (tc->cb) opened a new fd that happened
-     * to reuse the same number, the run loop's np_evloop_del would
-     * corrupt that new entry.  Now we return 0 (success) so the run
-     * loop does NOT attempt a second cleanup — we handle it all here. */
-    np_evloop_del(loop, fd);
+     * If the callback already cancelled this timer via del_timer(),
+     * tc has already been freed and we MUST NOT touch it again.
+     * We detect that case by re-checking the entry under the lock —
+     * if del_timer ran, the entry's userdata is now NULL. */
+    pthread_mutex_lock(&loop->lock);
+    bool already_cleaned = false;
+    if (fd < loop->entries_cap) {
+        np_ev_entry_t *e = &loop->entries[fd];
+        if (e->userdata != tc) {
+            /* del_timer ran during the callback and freed tc */
+            already_cleaned = true;
+        } else {
+            /* We still own tc. Clear the entry, close fd, free tc. */
+            epoll_ctl(loop->epfd, EPOLL_CTL_DEL, fd, NULL);
+            memset(&loop->entries[fd], 0, sizeof(loop->entries[fd]));
+        }
+    }
+    pthread_mutex_unlock(&loop->lock);
+
+    if (already_cleaned) {
+        /* tc is already freed and fd already closed. */
+        return 0;
+    }
+
     close(fd);
     free(tc);
     return 0; /* we already cleaned up; don't let the run loop double-delete */
@@ -234,58 +351,105 @@ static int timer_dispatch(np_evloop_t *loop, int fd,
 int np_evloop_add_timer(np_evloop_t *loop, int ms,
                          np_timer_cb cb, void *userdata)
 {
+    if (!loop || !cb) return -1;
+
     int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
-    if (tfd < 0) return -1;
+    if (tfd < 0) {
+        NP_LOG_ERROR("timerfd_create: %s", strerror(errno));
+        return -1;
+    }
 
     struct itimerspec ts = {
         .it_interval = {0, 0},
         .it_value    = { .tv_sec  = ms / 1000,
                          .tv_nsec = (long)(ms % 1000) * 1000000L }
     };
-    timerfd_settime(tfd, 0, &ts, NULL);
+    if (timerfd_settime(tfd, 0, &ts, NULL) < 0) {
+        NP_LOG_ERROR("timerfd_settime: %s", strerror(errno));
+        close(tfd);
+        return -1;
+    }
 
     timer_ctx_t *tc = malloc(sizeof(*tc));
     if (!tc) { close(tfd); return -1; }
-    tc->cb = cb;
-    tc->ud = userdata;
+    tc->cb          = cb;
+    tc->ud          = userdata;
+    tc->dispatched  = false;
+
+    pthread_mutex_lock(&loop->lock);
     tc->id = loop->next_timer_id++;
 
-    if (np_evloop_add(loop, tfd, NP_EV_READ, timer_dispatch, tc) < 0) {
+    if (entries_ensure_locked(loop, tfd) < 0) {
+        pthread_mutex_unlock(&loop->lock);
         free(tc);
         close(tfd);
         return -1;
     }
 
-    /* Bug 1 fix: mark the entry as a timer so np_evloop_del_timer can
-     * find it by timer_id.  Without this, del_timer was a silent no-op
-     * and every cancelled timer leaked its fd + timer_ctx_t. */
-    if (tfd < loop->entries_cap) {
-        np_ev_entry_t *e = &loop->entries[tfd];
-        e->is_timer  = true;
-        e->timer_id  = tc->id;
-        e->timer_cb  = cb;
-    }
+    /* Bug C1 fix: fully populate the entry BEFORE adding to epoll.
+     * If the timer fires immediately (ms=0) the dispatch will run
+     * with the entry already marked as a timer — no race window. */
+    np_ev_entry_t *e = &loop->entries[tfd];
+    e->fd       = tfd;
+    e->events   = NP_EV_READ;
+    e->cb       = timer_dispatch;
+    e->userdata = tc;
+    e->is_timer = true;
+    e->timer_cb = cb;
+    e->timer_id = tc->id;
 
-    return tc->id;
+    struct epoll_event ev = { .events = EPOLLIN, .data.fd = tfd };
+    if (epoll_ctl(loop->epfd, EPOLL_CTL_ADD, tfd, &ev) < 0) {
+        NP_LOG_ERROR("epoll_ctl(ADD timer fd=%d): %s", tfd, strerror(errno));
+        memset(e, 0, sizeof(*e));   /* roll back */
+        pthread_mutex_unlock(&loop->lock);
+        free(tc);
+        close(tfd);
+        return -1;
+    }
+    int id = tc->id;
+    pthread_mutex_unlock(&loop->lock);
+
+    return id;
 }
 
 void np_evloop_del_timer(np_evloop_t *loop, int timer_id)
 {
-    /* Walk entries to find the timerfd with this id */
+    if (!loop) return;
+
+    pthread_mutex_lock(&loop->lock);
     for (int i = 0; i < loop->entries_cap; i++) {
         np_ev_entry_t *e = &loop->entries[i];
         if (e->is_timer && e->timer_id == timer_id) {
-            int fd = e->fd;
-            void *ud = e->userdata;
+            int    fd = e->fd;
+            void  *ud = e->userdata;
+            timer_ctx_t *tc = (timer_ctx_t *)ud;
+
             /* Clear the entry first so np_evloop_del doesn't double-clear. */
-            np_evloop_del(loop, fd);
+            epoll_ctl(loop->epfd, EPOLL_CTL_DEL, fd, NULL);
+            memset(e, 0, sizeof(*e));
+
+            /* Bug C2 fix: if del_timer is being called from inside the
+             * timer's own callback (dispatched == true), the dispatch
+             * function still holds a reference to tc and will free it
+             * after we return.  We close the fd here (so the dispatch's
+             * close() is a no-op double-close on an EBADF fd, which is
+             * harmless) but we MUST NOT free tc — let dispatch do it.
+             *
+             * If del_timer is being called from any other context
+             * (dispatched == false), we own tc and free it here. */
+            bool already_dispatched = (tc != NULL && tc->dispatched);
+
+            pthread_mutex_unlock(&loop->lock);
+
             close(fd);
-            /* Bug 1 fix: free the timer_ctx_t that was allocated in
-             * np_evloop_add_timer.  Previously this was leaked. */
-            free(ud);
+            if (!already_dispatched) {
+                free(ud);
+            }
             return;
         }
     }
+    pthread_mutex_unlock(&loop->lock);
 }
 
 /* ------------------------------------------------------------------ */
@@ -294,6 +458,7 @@ void np_evloop_del_timer(np_evloop_t *loop, int timer_id)
 
 void np_evloop_run(np_evloop_t *loop)
 {
+    if (!loop) return;
     loop->running = true;
     NP_LOG_DEBUG("%s", "evloop starting");
 
@@ -317,12 +482,26 @@ void np_evloop_run(np_evloop_t *loop)
                 break;
             }
 
-            if (fd >= loop->entries_cap) continue;
+            /* Bug M6 fix: snapshot the entry under the lock so a
+             * concurrent np_evloop_del doesn't free the userdata
+             * while we're calling the callback.  If the entry was
+             * already cleared (cb == NULL), skip. */
+            pthread_mutex_lock(&loop->lock);
+            if (fd >= loop->entries_cap || fd < 0) {
+                pthread_mutex_unlock(&loop->lock);
+                continue;
+            }
             np_ev_entry_t *e = &loop->entries[fd];
-            if (!e->cb) continue;
+            if (!e->cb) {
+                pthread_mutex_unlock(&loop->lock);
+                continue;
+            }
+            np_ev_cb cb       = e->cb;
+            void    *userdata = e->userdata;
+            pthread_mutex_unlock(&loop->lock);
 
             uint32_t np_evs = epoll_to_np(loop->ev_buf[i].events);
-            int rc = e->cb(loop, fd, np_evs, e->userdata);
+            int rc = cb(loop, fd, np_evs, userdata);
             if (rc < 0) np_evloop_del(loop, fd);
         }
     }
@@ -332,6 +511,7 @@ void np_evloop_run(np_evloop_t *loop)
 
 void np_evloop_stop(np_evloop_t *loop)
 {
+    if (!loop) return;
     loop->running = false;
     /* wake epoll_wait */
     uint64_t v = 1;

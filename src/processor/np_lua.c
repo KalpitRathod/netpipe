@@ -67,6 +67,11 @@ typedef struct {
 
 #define LUA_NETPIPE_PROC_KEY "netpipe_processor"
 
+/* Bug LU1 fix: cap Lua VM memory at 16 MiB so a buggy or malicious
+ * script cannot OOM the netpipe process.  Tracked via the custom
+ * allocator below. */
+#define NP_LUA_MEM_LIMIT  (16UL * 1024UL * 1024UL)
+
 typedef struct {
     lua_State *L;
     char       script_path[256];
@@ -74,7 +79,68 @@ typedef struct {
     int        process_ref;
     int        init_ref;
     int        free_ref;
+    size_t     mem_used;     /* current Lua VM allocations (bytes) */
+    size_t     mem_limit;    /* hard cap on Lua VM allocations */
 } lua_priv_t;
+
+/* Bug LU1 fix: custom allocator that enforces a hard memory cap on
+ * the Lua VM.  Without this, a script like `while true do t = t ..
+ * "x" end` could grow the VM until the OS OOM-killed the netpipe
+ * process. */
+static void *np_lua_alloc(void *ud, void *ptr, size_t osize, size_t nsize)
+{
+    lua_priv_t *priv = (lua_priv_t *)ud;
+    if (nsize == 0) {
+        free(ptr);
+        if (priv) priv->mem_used -= osize;
+        return NULL;
+    }
+    if (priv) {
+        /* signed-safe delta: if nsize > osize, we're growing. */
+        size_t delta = (nsize > osize) ? (nsize - osize) : 0;
+        if (delta > 0 && priv->mem_used + delta > priv->mem_limit) {
+            NP_LOG_ERROR("Lua VM hit memory limit (%zu bytes); "
+                        "allocation of %zu bytes rejected",
+                        priv->mem_limit, nsize);
+            return NULL;  /* Lua treats this as out-of-memory */
+        }
+        priv->mem_used = priv->mem_used - osize + nsize;
+    }
+    return realloc(ptr, nsize);
+}
+
+/* Bug LU1 fix: open only the safe Lua standard libraries.  We OMIT
+ * `io`, `os`, `package`, and `debug` because they give the script
+ * filesystem, process-spawn, module-loading, and introspection
+ * capabilities — none of which a packet-processing script should
+ * need, and all of which are exploitation vectors if an untrusted
+ * script is loaded.  We also nullify `dofile`, `loadfile`, `load`,
+ * and `require` from the base library so the script can't sideload
+ * additional Lua bytecode from disk. */
+static void np_lua_open_safe_libs(lua_State *L)
+{
+    /* luaL_openlibs opens: base, package, table, io, os, string, math,
+     * coroutine, utf8, debug.  We whitelist only: base, table, string,
+     * math, coroutine, utf8. */
+    luaL_requiref(L, LUA_GNAME,      luaopen_base,       1); lua_pop(L, 1);
+    luaL_requiref(L, LUA_TABLIBNAME, luaopen_table,      1); lua_pop(L, 1);
+    luaL_requiref(L, LUA_STRLIBNAME, luaopen_string,     1); lua_pop(L, 1);
+    luaL_requiref(L, LUA_MATHLIBNAME,luaopen_math,       1); lua_pop(L, 1);
+#if LUA_VERSION_NUM >= 502
+    luaL_requiref(L, LUA_COLIBNAME,  luaopen_coroutine,  1); lua_pop(L, 1);
+#endif
+#if LUA_VERSION_NUM >= 503
+    luaL_requiref(L, LUA_UTF8LIBNAME,luaopen_utf8,       1); lua_pop(L, 1);
+#endif
+
+    /* Harden the base library: remove file/code-loading primitives. */
+    lua_pushnil(L); lua_setglobal(L, "dofile");
+    lua_pushnil(L); lua_setglobal(L, "loadfile");
+    lua_pushnil(L); lua_setglobal(L, "load");
+    lua_pushnil(L); lua_setglobal(L, "require");
+    lua_pushnil(L); lua_setglobal(L, "module");
+    lua_pushnil(L); lua_setglobal(L, "package");
+}
 
 static int l_register_processor(lua_State *L)
 {
@@ -92,10 +158,10 @@ static int l_register_processor(lua_State *L)
     // The argument must be a table
     luaL_checktype(L, 1, LUA_TTABLE);
 
-    // 1. Get name
+    // 1. Get name (Bug LU5 fix: snprintf guarantees NUL-termination)
     lua_getfield(L, 1, "name");
     const char *name = luaL_optstring(L, -1, "lua_processor");
-    strncpy(priv->name, name, sizeof(priv->name) - 1);
+    snprintf(priv->name, sizeof(priv->name), "%s", name);
     lua_pop(L, 1);
 
     // 2. Get process callback
@@ -335,8 +401,15 @@ static np_err_t lua_process(np_processor_t *proc, np_packet_t *pkt)
     lua_push_l3_l4_fields(L, pkt);
     lua_push_dns_fields(L, pkt);
 
+    /* Bug LU2 fix: guard against NULL pkt->raw — hand-constructed or
+     * partially-initialized packets may have raw == NULL even when
+     * caplen > 0. */
     lua_pushstring(L, "raw");
-    lua_pushlstring(L, (const char *)pkt->raw, pkt->caplen);
+    if (pkt->raw && pkt->caplen > 0) {
+        lua_pushlstring(L, (const char *)pkt->raw, pkt->caplen);
+    } else {
+        lua_pushlstring(L, "", 0);
+    }
     lua_settable(L, -3);
 
     // Add deepest layer's payload
@@ -351,7 +424,16 @@ static np_err_t lua_process(np_processor_t *proc, np_packet_t *pkt)
 
     // Call the function (1 arg, up to 2 return values)
     if (lua_pcall(L, 1, 2, 0) != LUA_OK) {
-        NP_LOG_ERROR("Lua process callback execution error: %s", lua_tostring(L, -1));
+        /* Bug LU3 fix: lua_tostring may return NULL if the error on the
+         * stack isn't a string (e.g. a table).  luaL_tolstring always
+         * returns a valid string (pushing it on the stack — pop after). */
+        const char *err = lua_tostring(L, -1);
+        if (!err) {
+            luaL_tolstring(L, -1, NULL);
+            err = lua_tostring(L, -1);
+            lua_pop(L, 1);
+        }
+        NP_LOG_ERROR("Lua process callback execution error: %s", err ? err : "<unknown>");
         lua_pop(L, 1);
         return NP_ERR_GENERIC;
     }
@@ -394,15 +476,23 @@ static np_err_t lua_process(np_processor_t *proc, np_packet_t *pkt)
 static void lua_free(np_processor_t *proc)
 {
     lua_priv_t *priv = proc->priv;
+    if (!priv) { free(proc); return; }
     if (priv->L) {
         if (priv->free_ref != LUA_NOREF) {
             lua_rawgeti(priv->L, LUA_REGISTRYINDEX, priv->free_ref);
             if (lua_pcall(priv->L, 0, 0, 0) != LUA_OK) {
-                NP_LOG_WARN("Lua free callback execution error: %s", lua_tostring(priv->L, -1));
+                const char *err = lua_tostring(priv->L, -1);
+                if (!err) {
+                    luaL_tolstring(priv->L, -1, NULL);
+                    err = lua_tostring(priv->L, -1);
+                    lua_pop(priv->L, 1);
+                }
+                NP_LOG_WARN("Lua free callback execution error: %s", err ? err : "<unknown>");
                 lua_pop(priv->L, 1);
             }
         }
         lua_close(priv->L);
+        priv->L = NULL;
     }
     free(priv);
     free(proc);
@@ -431,16 +521,22 @@ np_processor_t *np_processor_lua(const char *script_path)
     proc->ops  = &lua_processor_ops;
     proc->priv = priv;
 
-    // 1. Create Lua State
-    priv->L = luaL_newstate();
+    // 1. Create Lua State (Bug LU1 fix: with custom memory-capping allocator)
+    priv->mem_limit = NP_LUA_MEM_LIMIT;
+    priv->mem_used  = 0;
+    priv->L = lua_newstate(np_lua_alloc, priv);
     if (!priv->L) {
         NP_LOG_ERROR("%s", "failed to create Lua state");
         lua_free(proc);
         return NULL;
     }
+    /* Initialise the panic + warn handlers so uncaught errors don't
+     * kill the whole process. */
+    lua_atpanic(priv->L, NULL);
 
-    // 2. Open Lua standard libraries
-    luaL_openlibs(priv->L);
+    // 2. Open only the safe Lua standard libraries (Bug LU1 fix:
+    //    no io, no os, no package, no require)
+    np_lua_open_safe_libs(priv->L);
 
     // 3. Register NP_REGISTER_PROCESSOR global function
     lua_register(priv->L, "NP_REGISTER_PROCESSOR", l_register_processor);
@@ -451,7 +547,14 @@ np_processor_t *np_processor_lua(const char *script_path)
 
     // 5. Load and run the Lua script file
     if (luaL_dofile(priv->L, script_path) != LUA_OK) {
-        NP_LOG_ERROR("failed to load Lua script '%s': %s", script_path, lua_tostring(priv->L, -1));
+        /* Bug LU3 fix: luaL_tolstring guarantees a non-NULL string. */
+        const char *err = lua_tostring(priv->L, -1);
+        if (!err) {
+            luaL_tolstring(priv->L, -1, NULL);
+            err = lua_tostring(priv->L, -1);
+            lua_pop(priv->L, 1);
+        }
+        NP_LOG_ERROR("failed to load Lua script '%s': %s", script_path, err ? err : "<unknown>");
         lua_free(proc);
         return NULL;
     }
@@ -466,7 +569,13 @@ np_processor_t *np_processor_lua(const char *script_path)
     if (priv->init_ref != LUA_NOREF) {
         lua_rawgeti(priv->L, LUA_REGISTRYINDEX, priv->init_ref);
         if (lua_pcall(priv->L, 0, 0, 0) != LUA_OK) {
-            NP_LOG_ERROR("Lua init callback execution error: %s", lua_tostring(priv->L, -1));
+            const char *err = lua_tostring(priv->L, -1);
+            if (!err) {
+                luaL_tolstring(priv->L, -1, NULL);
+                err = lua_tostring(priv->L, -1);
+                lua_pop(priv->L, 1);
+            }
+            NP_LOG_ERROR("Lua init callback execution error: %s", err ? err : "<unknown>");
             lua_free(proc);
             return NULL;
         }

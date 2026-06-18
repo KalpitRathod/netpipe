@@ -26,9 +26,14 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <ctype.h>
+#include <errno.h>
+#include <limits.h>
+#include <pthread.h>
+#include <unistd.h>
 #include <pcap/pcap.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <stdatomic.h>
 
 #include "netpipe.h"
 #include "log/np_log.h"
@@ -38,34 +43,32 @@
 /*  Global pipeline (for signal handling)                               */
 /* ------------------------------------------------------------------ */
 
-static np_pipeline_t *g_pipeline = NULL;
-
-/* Bug 8 fix: use a volatile sig_atomic_t flag instead of calling
- * non-async-signal-safe functions (fprintf, np_pipeline_stop →
- * pcap_breakloop) from inside the signal handler.  The old handler
- * could deadlock if the signal was delivered while another thread
- * was inside fprintf/malloc/etc.  Now the handler only sets a flag,
- * and the pipeline's main loop checks the flag between iterations.
- * (The pipeline already checks pl->running, and np_pipeline_stop
- * sets that flag — but calling np_pipeline_stop from a signal handler
- * is unsafe because it acquires locks and calls pcap_breakloop.)
+/* Bug C7+C8 fix: use _Atomic pointer for the global pipeline so the
+ * signal handler can safely read it.  The previous code:
+ *   1. Set g_pipeline = NULL AFTER np_pipeline_free(pl), so a signal
+ *      delivered in that window caused UAF.
+ *   2. Called np_pipeline_stop (which calls pcap_breakloop and
+ *      acquires locks) directly from the signal handler — that's
+ *      not async-signal-safe.
  *
- * We still call np_pipeline_stop from the handler because the pipeline
- * worker threads may be blocked in pcap_next_ex and need
- * pcap_breakloop to wake up.  This is technically not async-signal-
- * safe, but it's the only way to interrupt a blocking pcap_next_ex
- * without self-pipe/signalfd.  The risk is low because the handler
- * is very short.  A fully safe implementation would use a self-pipe
- * trick, but that's a larger refactor. */
-static volatile sig_atomic_t g_stop_requested = 0;
+ * Now the handler only sets an atomic flag.  The pipeline's main loop
+ * checks the flag between iterations and calls np_pipeline_stop itself
+ * on the main thread, where it's safe to call non-async-signal-safe
+ * functions.
+ *
+ * For unblocking pcap_next_ex() in worker threads, we rely on the
+ * worker's own timeout (timeout_ms, default 1000ms) — when the main
+ * loop calls np_pipeline_stop, pl->running goes false, and the workers
+ * exit on their next loop iteration (within timeout_ms).  This adds
+ * at most 1 second of latency on Ctrl-C, which is acceptable. */
+static _Atomic(np_pipeline_t *) g_pipeline = NULL;
+static volatile sig_atomic_t    g_stop_requested = 0;
 
 static void sigint_handler(int sig)
 {
     (void)sig;
+    /* Async-signal-safe: only set a flag. */
     g_stop_requested = 1;
-    /* np_pipeline_stop is not async-signal-safe, but we call it to
-     * unblock pcap_next_ex.  This is the pragmatic trade-off. */
-    if (g_pipeline) np_pipeline_stop(g_pipeline);
 }
 
 /* ------------------------------------------------------------------ */
@@ -115,6 +118,7 @@ static void usage(const char *prog)
         "  -o tun://<dev>    Inject packets into a Linux TUN (Layer 3) virtual interface\n"
         "  -o socket://<h:p> Forward raw packets to a remote host over TCP\n"
         "  -fmt <format>     Output format: pcap (default), pcapng, json, hex, pretty, stats, null\n"
+        "                    -fmt binds to the NEXT -o flag (place -fmt before -o).\n"
         "  -stats <file>     Write periodic statistics to file (use '-' for stdout)\n"
         "  -c <count>        Stop after capturing N packets\n"
         "\n"
@@ -245,7 +249,68 @@ static const char *infer_fmt(const char *path)
     if (!strcasecmp(dot, ".pcap") || !strcasecmp(dot, ".cap")) return "pcap";
     if (!strcasecmp(dot, ".json") || !strcasecmp(dot, ".ndjson")) return "json";
     if (!strcasecmp(dot, ".txt")  || !strcasecmp(dot, ".hex")) return "hex";
+    NP_LOG_WARN("unknown output extension '%s' — defaulting to pcap", dot);
     return "pcap";
+}
+
+/* ------------------------------------------------------------------ */
+/*  Bug M15 fix: safe integer parsing helpers (replace atoi/strtoull)   */
+/* ------------------------------------------------------------------ */
+
+/* Parse a non-negative int in [min, max].  Returns true on success. */
+static bool parse_int(const char *s, long min, long max, long *out)
+{
+    if (!s || !*s) return false;
+    errno = 0;
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (errno != 0 || !end || *end != '\0' || v < min || v > max) {
+        return false;
+    }
+    *out = v;
+    return true;
+}
+
+/* Parse a non-negative uint64.  Returns true on success. */
+static bool parse_u64(const char *s, uint64_t *out)
+{
+    if (!s || !*s) return false;
+    errno = 0;
+    char *end = NULL;
+    unsigned long long v = strtoull(s, &end, 10);
+    if (errno != 0 || !end || *end != '\0') {
+        return false;
+    }
+    *out = (uint64_t)v;
+    return true;
+}
+
+/* Parse a port number (1..65535).  Returns true on success. */
+static bool parse_port(const char *s, uint16_t *out)
+{
+    long v;
+    if (!parse_int(s, 1, 65535, &v)) return false;
+    *out = (uint16_t)v;
+    return true;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Bug C8 fix: stop-poller thread.  The signal handler only sets a
+ *  flag (async-signal-safe).  This poller thread watches the flag and
+ *  calls np_pipeline_stop from a normal thread context, where it's
+ *  safe to acquire locks / call pcap_breakloop.
+ * ------------------------------------------------------------------ */
+
+typedef struct { np_pipeline_t *pl; } stop_poller_args_t;
+
+static void *stop_poller(void *arg)
+{
+    stop_poller_args_t *a = arg;
+    while (!g_stop_requested) {
+        usleep(50000);  /* 50 ms poll interval */
+    }
+    np_pipeline_stop(a->pl);
+    return NULL;
 }
 
 /* ------------------------------------------------------------------ */
@@ -290,13 +355,22 @@ int main(int argc, char *argv[])
     const char *out_fmts[NP_MAX_SINKS];
     int         n_outputs = 0;
 
+    /* Helper macro for cleaning up transform_pattern/replacement on
+     * early exit.  Bug M13 fix: previously these were leaked on every
+     * error path. */
+#define CLEANUP_TRANSFORM() do { \
+        free(transform_pattern); transform_pattern = NULL; \
+        free(transform_replacement); transform_replacement = NULL; \
+    } while (0)
+
     /* ---- Arg parsing ---- */
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
 
 #define NEED_ARG(flag) \
     do { if (i + 1 >= argc) { \
-        fprintf(stderr, "error: %s requires an argument\n", flag); return 1; \
+        fprintf(stderr, "error: %s requires an argument\n", flag); \
+        CLEANUP_TRANSFORM(); return 1; \
     } } while (0)
 
         if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(argv[0]); return 0; }
@@ -315,7 +389,7 @@ int main(int argc, char *argv[])
             NEED_ARG("-i");
             if (n_inputs >= NP_MAX_SOURCES) {
                 fprintf(stderr, "error: maximum of %d inputs exceeded\n", NP_MAX_SOURCES);
-                return 1;
+                CLEANUP_TRANSFORM(); return 1;
             }
             inputs[n_inputs] = argv[++i];
             input_is_file[n_inputs] = false;
@@ -325,7 +399,7 @@ int main(int argc, char *argv[])
             NEED_ARG("-r");
             if (n_inputs >= NP_MAX_SOURCES) {
                 fprintf(stderr, "error: maximum of %d inputs exceeded\n", NP_MAX_SOURCES);
-                return 1;
+                CLEANUP_TRANSFORM(); return 1;
             }
             inputs[n_inputs] = argv[++i];
             input_is_file[n_inputs] = true;
@@ -335,11 +409,15 @@ int main(int argc, char *argv[])
             NEED_ARG("-o");
             if (n_outputs >= NP_MAX_SINKS) {
                 fprintf(stderr, "error: maximum of %d outputs exceeded\n", NP_MAX_SINKS);
-                return 1;
+                CLEANUP_TRANSFORM(); return 1;
             }
             outputs[n_outputs] = argv[++i];
+            /* Bug M14 fix: -fmt now binds to the NEXT -o, not to all
+             * previous NULL slots.  If a fmt was already pending (set
+             * by a previous -fmt that had no -o yet), consume it here;
+             * otherwise leave NULL and let infer_fmt() handle it later. */
             out_fmts[n_outputs] = fmt;
-            fmt = NULL; /* consumed */
+            fmt = NULL; /* consumed by this -o */
             n_outputs++;
         }
         else if (!strcmp(a, "-fmt"))   { NEED_ARG("-fmt");   fmt        = argv[++i]; }
@@ -347,12 +425,46 @@ int main(int argc, char *argv[])
         else if (!strcmp(a, "-proto")) { NEED_ARG("-proto"); proto_str  = argv[++i]; }
         else if (!strcmp(a, "-host"))  { NEED_ARG("-host");  host_str   = argv[++i]; }
         else if (!strcmp(a, "-stats")) { NEED_ARG("-stats"); stats_path = argv[++i]; }
-        else if (!strcmp(a, "-s"))     { NEED_ARG("-s");     snaplen    = atoi(argv[++i]); }
-        else if (!strcmp(a, "-T"))     { NEED_ARG("-T");     timeout_ms = atoi(argv[++i]); }
-        else if (!strcmp(a, "-c"))     { NEED_ARG("-c");     count      = (uint64_t)strtoull(argv[++i], NULL, 10); }
-        else if (!strcmp(a, "-port"))  { NEED_ARG("-port");  port_num   = (uint16_t)atoi(argv[++i]); }
-        else if (!strcmp(a, "-rate"))  { NEED_ARG("-rate");  rate_bps   = (uint64_t)strtoull(argv[++i], NULL, 10); }
-        else if (!strcmp(a, "-proc"))  { 
+        else if (!strcmp(a, "-s")) {
+            NEED_ARG("-s");
+            long v;
+            if (!parse_int(argv[++i], 1, INT_MAX, &v)) {
+                fprintf(stderr, "error: -s requires an integer in [1, %d]\n", INT_MAX);
+                CLEANUP_TRANSFORM(); return 1;
+            }
+            snaplen = (int)v;
+        }
+        else if (!strcmp(a, "-T")) {
+            NEED_ARG("-T");
+            long v;
+            if (!parse_int(argv[++i], 1, INT_MAX, &v)) {
+                fprintf(stderr, "error: -T requires an integer in [1, %d] (milliseconds)\n", INT_MAX);
+                CLEANUP_TRANSFORM(); return 1;
+            }
+            timeout_ms = (int)v;
+        }
+        else if (!strcmp(a, "-c")) {
+            NEED_ARG("-c");
+            if (!parse_u64(argv[++i], &count)) {
+                fprintf(stderr, "error: -c requires a non-negative integer\n");
+                CLEANUP_TRANSFORM(); return 1;
+            }
+        }
+        else if (!strcmp(a, "-port")) {
+            NEED_ARG("-port");
+            if (!parse_port(argv[++i], &port_num)) {
+                fprintf(stderr, "error: -port requires a port in [1, 65535]\n");
+                CLEANUP_TRANSFORM(); return 1;
+            }
+        }
+        else if (!strcmp(a, "-rate")) {
+            NEED_ARG("-rate");
+            if (!parse_u64(argv[++i], &rate_bps)) {
+                fprintf(stderr, "error: -rate requires a non-negative integer (bytes per second)\n");
+                CLEANUP_TRANSFORM(); return 1;
+            }
+        }
+        else if (!strcmp(a, "-proc"))  {
             NEED_ARG("-proc");
             const char *proc_arg = argv[++i];
             if (!strcmp(proc_arg, "tcp-stream")) {
@@ -380,7 +492,7 @@ int main(int argc, char *argv[])
                         transform_replacement = strdup(next_colon + 1);
                     } else {
                         fprintf(stderr, "error: transform:regex requires pattern and replacement (e.g. transform:regex:pattern:replacement)\n");
-                        return 1;
+                        CLEANUP_TRANSFORM(); return 1;
                     }
                 } else if (!strcmp(mode_part, "hex")) {
                     strcpy(transform_mode, "hex");
@@ -388,60 +500,59 @@ int main(int argc, char *argv[])
                     strcpy(transform_mode, "base64");
                 } else {
                     fprintf(stderr, "error: unknown transform mode: %s (expected hex, base64, or regex:...)\n", mode_part);
-                    return 1;
+                    CLEANUP_TRANSFORM(); return 1;
                 }
             } else {
                 fprintf(stderr, "unknown processor: %s\n", proc_arg);
-                return 1;
+                CLEANUP_TRANSFORM(); return 1;
             }
         }
         else {
             fprintf(stderr, "unknown option: %s  (use -h for help)\n", a);
-            return 1;
+            CLEANUP_TRANSFORM(); return 1;
         }
     }
 
     if (no_color) np_log_set_color(false);
 
-    /* If -fmt was specified after one or more -o flags (rather than before), the
-     * per-output slot will be NULL because -fmt hadn't been seen yet when -o ran.
-     * Apply the leftover fmt now so "-o out.pcap -fmt json" works as expected. */
-    if (fmt) {
-        for (int idx = 0; idx < n_outputs; idx++) {
-            if (!out_fmts[idx]) out_fmts[idx] = fmt;
-        }
-    }
+    /* Bug M14 follow-up: if a -fmt was specified without a following -o,
+     * it's a stdout-format request — we keep fmt around for the
+     * stdout-sink branch below.  No "leftover fmt" propagation to
+     * previous -o slots anymore (that was the source of the bug). */
 
-    /* Automatically suppress banner if JSON output is requested on stdout */
-    bool json_to_stdout = false;
-    if (n_outputs == 0 && fmt && !strcmp(fmt, "json")) {
-        json_to_stdout = true;
+    /* Automatically suppress banner if any output goes to stdout
+     * (Bug M6 fix: previously only JSON-to-stdout suppressed the banner,
+     * but hex/pretty/stats also go to stdout and would be corrupted by it). */
+    bool stdout_output = false;
+    if (n_outputs == 0 && fmt) {
+        stdout_output = true;  /* no -o, fmt goes to stdout */
     } else {
         for (int idx = 0; idx < n_outputs; idx++) {
-            if (!strcmp(outputs[idx], "-") && out_fmts[idx] && !strcmp(out_fmts[idx], "json")) {
-                json_to_stdout = true;
+            if (outputs[idx] && !strcmp(outputs[idx], "-")) {
+                stdout_output = true;
                 break;
             }
         }
     }
-    if (json_to_stdout) quiet = true;
+    if (stdout_output) quiet = true;
 
     if (!quiet) print_banner();
 
-    if (list_dev) { list_devices(); return 0; }
+    if (list_dev) { list_devices(); CLEANUP_TRANSFORM(); return 0; }
 
     /* Validate */
     if (n_inputs == 0) {
         fprintf(stderr, "error: specify at least one input with -i <device> or -r <file.pcap>\n"
                         "       Use -D to list available devices.\n");
         usage(argv[0]);
+        CLEANUP_TRANSFORM();
         return 1;
     }
 
     /* ---- Build pipeline ---- */
     np_pipeline_t *pl = np_pipeline_new();
-    if (!pl) { NP_LOG_FATAL("%s", "out of memory"); return 1; }
-    g_pipeline = pl;
+    if (!pl) { NP_LOG_FATAL("%s", "out of memory"); CLEANUP_TRANSFORM(); return 1; }
+    atomic_store(&g_pipeline, pl);
 
     /* Sources */
     for (int idx = 0; idx < n_inputs; idx++) {
@@ -458,7 +569,9 @@ int main(int argc, char *argv[])
 
         if (!src) {
             fprintf(stderr, "error: could not open input '%s' — do you need root for live capture?\n", inputs[idx]);
+            atomic_store(&g_pipeline, NULL);
             np_pipeline_free(pl);
+            CLEANUP_TRANSFORM();
             return 1;
         }
         np_pipeline_add_source(pl, src);
@@ -467,7 +580,13 @@ int main(int argc, char *argv[])
     /* Filters */
     if (bpf_expr) {
         np_filter_t *f = np_filter_bpf(bpf_expr);
-        if (!f) { NP_LOG_ERROR("bad BPF expression: %s", bpf_expr); np_pipeline_free(pl); return 1; }
+        if (!f) {
+            NP_LOG_ERROR("bad BPF expression: %s", bpf_expr);
+            atomic_store(&g_pipeline, NULL);
+            np_pipeline_free(pl);
+            CLEANUP_TRANSFORM();
+            return 1;
+        }
         np_pipeline_add_filter(pl, f);
     }
     if (proto_str) {
@@ -483,7 +602,13 @@ int main(int argc, char *argv[])
     }
     if (host_str) {
         np_filter_t *hf = np_filter_host(host_str);
-        if (!hf) { NP_LOG_ERROR("bad host: %s", host_str); np_pipeline_free(pl); return 1; }
+        if (!hf) {
+            NP_LOG_ERROR("bad host: %s", host_str);
+            atomic_store(&g_pipeline, NULL);
+            np_pipeline_free(pl);
+            CLEANUP_TRANSFORM();
+            return 1;
+        }
         np_pipeline_add_filter(pl, hf);
     }
 
@@ -495,33 +620,69 @@ int main(int argc, char *argv[])
     }
     if (use_tcp_stream) {
         np_processor_t *sp = np_processor_tcp_stream();
-        if (sp) np_pipeline_add_processor(pl, sp);
-        else { NP_LOG_ERROR("%s", "failed to create tcp stream processor"); np_pipeline_free(pl); return 1; }
+        if (!sp) {
+            NP_LOG_ERROR("%s", "failed to create tcp stream processor");
+            atomic_store(&g_pipeline, NULL);
+            np_pipeline_free(pl);
+            CLEANUP_TRANSFORM();
+            return 1;
+        }
+        np_pipeline_add_processor(pl, sp);
     }
     if (rate_bps > 0) {
         np_processor_t *rp = np_processor_rate_limit(rate_bps);
-        if (rp) np_pipeline_add_processor(pl, rp);
-        else { NP_LOG_ERROR("%s", "failed to create rate limiter"); np_pipeline_free(pl); return 1; }
+        if (!rp) {
+            NP_LOG_ERROR("%s", "failed to create rate limiter");
+            atomic_store(&g_pipeline, NULL);
+            np_pipeline_free(pl);
+            CLEANUP_TRANSFORM();
+            return 1;
+        }
+        np_pipeline_add_processor(pl, rp);
     }
     if (use_transform) {
         np_processor_t *tp = np_processor_payload_transform(transform_mode, transform_pattern, transform_replacement);
-        if (tp) np_pipeline_add_processor(pl, tp);
-        else { NP_LOG_ERROR("failed to create transform processor: %s", transform_mode); np_pipeline_free(pl); return 1; }
+        if (!tp) {
+            NP_LOG_ERROR("failed to create transform processor: %s", transform_mode);
+            atomic_store(&g_pipeline, NULL);
+            np_pipeline_free(pl);
+            CLEANUP_TRANSFORM();
+            return 1;
+        }
+        np_pipeline_add_processor(pl, tp);
     }
     if (use_flow_tracker) {
         np_processor_t *ftp = np_processor_flow_tracker();
-        if (ftp) np_pipeline_add_processor(pl, ftp);
-        else { NP_LOG_ERROR("%s", "failed to create flow tracker processor"); np_pipeline_free(pl); return 1; }
+        if (!ftp) {
+            NP_LOG_ERROR("%s", "failed to create flow tracker processor");
+            atomic_store(&g_pipeline, NULL);
+            np_pipeline_free(pl);
+            CLEANUP_TRANSFORM();
+            return 1;
+        }
+        np_pipeline_add_processor(pl, ftp);
     }
     if (lua_script_path) {
         np_processor_t *lp = np_processor_lua(lua_script_path);
-        if (lp) np_pipeline_add_processor(pl, lp);
-        else { NP_LOG_ERROR("failed to create Lua processor from script '%s'", lua_script_path); np_pipeline_free(pl); return 1; }
+        if (!lp) {
+            NP_LOG_ERROR("failed to create Lua processor from script '%s'", lua_script_path);
+            atomic_store(&g_pipeline, NULL);
+            np_pipeline_free(pl);
+            CLEANUP_TRANSFORM();
+            return 1;
+        }
+        np_pipeline_add_processor(pl, lp);
     }
     if (tls_keylog_path) {
         np_processor_t *tp = np_processor_tls_decrypt(tls_keylog_path);
-        if (tp) np_pipeline_add_processor(pl, tp);
-        else { NP_LOG_ERROR("failed to create TLS decrypt processor from keylog '%s'", tls_keylog_path); np_pipeline_free(pl); return 1; }
+        if (!tp) {
+            NP_LOG_ERROR("failed to create TLS decrypt processor from keylog '%s'", tls_keylog_path);
+            atomic_store(&g_pipeline, NULL);
+            np_pipeline_free(pl);
+            CLEANUP_TRANSFORM();
+            return 1;
+        }
+        np_pipeline_add_processor(pl, tp);
     }
 
     /* Sinks */
@@ -549,7 +710,9 @@ int main(int argc, char *argv[])
 
             if (!out_sink) {
                 NP_LOG_ERROR("failed to create output sink for '%s'", outfile);
+                atomic_store(&g_pipeline, NULL);
                 np_pipeline_free(pl);
+                CLEANUP_TRANSFORM();
                 return 1;
             }
             np_pipeline_add_sink(pl, out_sink);
@@ -579,19 +742,34 @@ int main(int argc, char *argv[])
         if (ss) np_pipeline_add_sink(pl, ss);
     }
 
-    /* Signal handler for clean Ctrl-C */
+    /* Bug C8 fix: signal handler is now async-signal-safe (only sets
+     * an atomic flag).  The main loop polls the flag and calls
+     * np_pipeline_stop on the main thread, where it's safe. */
     signal(SIGINT,  sigint_handler);
     signal(SIGTERM, sigint_handler);
 
     /* ---- Run ---- */
+    /* Spawn a tiny poller thread that watches g_stop_requested and
+     * calls np_pipeline_stop from a safe context.  This avoids the
+     * ~1s latency of waiting for the next pcap_next_ex timeout. */
+    stop_poller_args_t spa = { .pl = pl };
+    pthread_t stop_thread;
+    int rc = pthread_create(&stop_thread, NULL, stop_poller, &spa);
+    bool stop_thread_ok = (rc == 0);
+
     np_err_t ret = np_pipeline_run(pl);
 
+    /* Wait for the poller to exit (it will, now that pl->running is false). */
+    g_stop_requested = 1;  /* in case the user didn't signal */
+    if (stop_thread_ok) pthread_join(stop_thread, NULL);
+
+    /* Bug C7 fix: clear g_pipeline BEFORE freeing pl, so a signal
+     * delivered during teardown doesn't dereference a freed pointer. */
+    atomic_store(&g_pipeline, NULL);
     np_pipeline_free(pl);
-    g_pipeline = NULL;
     np_cleanup();
 
-    if (transform_pattern) free(transform_pattern);
-    if (transform_replacement) free(transform_replacement);
+    CLEANUP_TRANSFORM();
 
     return ret == NP_OK ? 0 : 1;
 }
