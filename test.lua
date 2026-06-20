@@ -1,8 +1,21 @@
 -- test.lua  —  DNS exfil-payload isolation harness
 --
--- This script registers a Lua processor on the netpipe pipeline and, for
--- every packet that reaches it, writes the internal keys/properties of
--- that packet to /tmp/netpipe_packet.log.
+-- FIX (sandbox compatibility): the previous version called io.open() in
+-- init() to write to /tmp/netpipe_packet.log, but np_lua_open_safe_libs
+-- in np_lua.c deliberately nils out `io`, `os`, `package`, `debug`,
+-- `dofile`, `loadfile`, `load`, and `require` to prevent untrusted
+-- scripts from touching the filesystem.  As a result the old test.lua
+-- would fail at processor construction time with
+-- "attempt to index a nil value (global 'io')".
+--
+-- The fix has two parts:
+--   (1) Replace file I/O with a stdout/stderr streamer (print).  This
+--       is allowed by the sandbox and produces a streamable log on
+--       stderr that the operator can redirect with `2> /tmp/...log`.
+--   (2) Use the new `np_log(level, msg)` C binding (added in this same
+--       patch set) when available, so logs go through netpipe's own
+--       leveled logger with timestamps and file:line info.  We probe
+--       for it at init time and degrade gracefully if absent.
 --
 -- A "test case" is flagged as EXFIL_DETECTED when:
 --   * proto == "DNS"
@@ -12,11 +25,8 @@
 --
 -- The expected test packet this harness was written for is:
 --   21:31:02  10.124.56.172 → 8.8.8.8  dns  Q A
---            exfil-payload-data-infosec-test-abc123xyz987-long-domain.com
+--             exfil-payload-data-infosec-test-abc123xyz987-long-domain.com
 
-local LOG_PATH = "/tmp/netpipe_packet.log"
-
-local log         -- file handle, opened in init(), closed in free()
 local total       = 0
 local exfil_hits  = 0
 
@@ -24,6 +34,21 @@ local exfil_hits  = 0
 local MIN_NAME_LEN  = 40
 local EXFIL_PATTERN = "exfil[%-_]payload"
 local EXFIL_DST_IP  = "8.8.8.8"
+
+-- Optional C-side bridge.  np_log is registered by np_lua.c in this
+-- patch set; if it's not present (older netpipe build) we fall back to
+-- plain `print`, which still works inside the sandbox.
+local np_log = rawget(_G, "np_log")
+local function log(level, msg)
+    if np_log then
+        np_log(level, msg)
+    else
+        -- Sandbox-safe fallback: print always works (it goes to stdout).
+        -- We deliberately do NOT touch `io` here — the sandbox nils it
+        -- out, so any `io.write(...)` reference would crash.
+        print(msg)
+    end
+end
 
 -- tiny string pattern helper: returns true if `s` contains `pattern`
 local function matches(s, pattern)
@@ -98,16 +123,13 @@ NP_REGISTER_PROCESSOR({
     name = "exfil_payload_isolator",
 
     init = function()
-        log = io.open(LOG_PATH, "w")   -- truncate on every fresh run
-        if not log then
-            error(string.format("could not open %s for writing", LOG_PATH))
-        end
-        log:write(string.format("# netpipe packet log\n"))
-        log:write(string.format("# created by test.lua (exfil_payload_isolator)\n"))
-        log:write(string.format("# detection rules: name_len>=%d  pattern=%q  dst=%s\n\n",
+        -- FIX: no file I/O.  Logs go to stdout/stderr (redirect with
+        -- `2>/tmp/netpipe_packet.log` if you want a file).
+        log("info", "# netpipe packet log")
+        log("info", "# created by test.lua (exfil_payload_isolator)")
+        log("info", string.format("# detection rules: name_len>=%d  pattern=%q  dst=%s",
                                 MIN_NAME_LEN, EXFIL_PATTERN, EXFIL_DST_IP))
-        log:flush()
-        print(string.format("[LUA] logging packet introspection to %s", LOG_PATH))
+        print(string.format("[LUA] logging packet introspection to stderr (redirect with 2>file)"))
     end,
 
     process = function(pkt)
@@ -117,11 +139,15 @@ NP_REGISTER_PROCESSOR({
             exfil_hits = exfil_hits + 1
         end
 
-        log:write(dump_packet(pkt, tag))
-        log:flush()
+        -- FIX: stream to stdout via print (sandbox-safe); for the
+        -- detailed dump, route through the leveled logger so each line
+        -- is timestamped and prefixed with file:line.
+        local dump = dump_packet(pkt, tag)
+        for line in dump:gmatch("[^\n]*") do
+            log("info", line)
+        end
 
-        -- Also print a one-line summary to stdout so the operator can see
-        -- progress without tailing the log file.
+        -- One-line summary to stdout so the operator can see progress.
         print(string.format("[LUA] #%d  proto=%-4s  %-15s:%-5s -> %-15s:%-5s  tag=%s%s",
               pkt.seq, pkt.proto,
               pkt.src_ip or "?", pkt.src_port or 0,
@@ -133,15 +159,12 @@ NP_REGISTER_PROCESSOR({
     end,
 
     free = function()
-        if log then
-            log:write(string.format("# ==== summary ====\n"))
-            log:write(string.format("# total_packets    = %d\n", total))
-            log:write(string.format("# exfil_detected   = %d\n", exfil_hits))
-            log:write(string.format("# status           = %s\n",
-                                    exfil_hits > 0 and "EXFIL_PAYLOAD_FOUND" or "NO_EXFIL_PAYLOAD"))
-            log:close()
-        end
-        print(string.format("[LUA] total=%d  exfil_hits=%d  log=%s",
-              total, exfil_hits, LOG_PATH))
+        log("info", "# ==== summary ====")
+        log("info", string.format("# total_packets    = %d", total))
+        log("info", string.format("# exfil_detected   = %d", exfil_hits))
+        log("info", string.format("# status           = %s",
+                                exfil_hits > 0 and "EXFIL_PAYLOAD_FOUND" or "NO_EXFIL_PAYLOAD"))
+        print(string.format("[LUA] total=%d  exfil_hits=%d  (logs on stderr)",
+              total, exfil_hits))
     end,
 })

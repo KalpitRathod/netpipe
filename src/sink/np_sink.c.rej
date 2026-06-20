@@ -1,0 +1,10 @@
+--- src/sink/np_sink.c	2026-06-18 05:01:27.921273704 +0000
++++ home/z/my-project/netpipe-patches/src/sink/np_sink.c	2026-06-18 05:54:06.737407640 +0000
+@@ -979,6 +1004,7 @@
+     if (!uri) { NP_LOG_ERROR("np_sink_tuntap: uri is NULL"); return NULL; }
+     bool is_tun = false;
+     char dev_name[16] = {0};
++    bool synth_eth = false;
+ 
+     if (strncmp(uri, "tun://", 6) == 0) {
+         is_tun = true;

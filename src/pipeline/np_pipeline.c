@@ -10,6 +10,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <time.h>
+#include <errno.h>
 #include <stdatomic.h>
 
 #include "netpipe.h"
@@ -159,23 +160,37 @@ static void queue_push(pkt_queue_t *q, np_packet_t *pkt, np_linktype_t linktype,
 static bool queue_pop(pkt_queue_t *q, np_packet_t **out_pkt, np_linktype_t *out_lt, int timeout_ms)
 {
     pthread_mutex_lock(&q->lock);
+    /* Bug B20 fix: compute the absolute deadline ONCE outside the loop.
+     * The old code recomputed `ts = now + timeout_ms` on every iteration,
+     * which means under repeated spurious wakeups the effective wait was
+     * unbounded (each wakeup pushed the deadline forward by another
+     * timeout_ms).  Now we compute the deadline once and let
+     * pthread_cond_timedwait enforce it. */
+    struct timespec deadline = {0, 0};
+    if (timeout_ms > 0) {
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_nsec += (long)timeout_ms * 1000000L;
+        if (deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_sec  += deadline.tv_nsec / 1000000000L;
+            deadline.tv_nsec %= 1000000000L;
+        }
+    }
     while (!q->head) {
         if (timeout_ms <= 0) {
             pthread_mutex_unlock(&q->lock);
             return false;
         }
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += (long)timeout_ms * 1000000L;
-        if (ts.tv_nsec >= 1000000000L) {
-            ts.tv_sec += ts.tv_nsec / 1000000000L;
-            ts.tv_nsec %= 1000000000L;
-        }
-        int rc = pthread_cond_timedwait(&q->cond, &q->lock, &ts);
-        if (rc != 0) {
+        int rc = pthread_cond_timedwait(&q->cond, &q->lock, &deadline);
+        if (rc == ETIMEDOUT) {
             pthread_mutex_unlock(&q->lock);
             return false;
         }
+        if (rc != 0) {
+            /* Any other error — treat as a timeout to avoid spinning. */
+            pthread_mutex_unlock(&q->lock);
+            return false;
+        }
+        /* rc == 0: signalled.  Loop back and re-check q->head. */
     }
 
     queue_node_t *node = q->head;

@@ -21,6 +21,9 @@ This wiki provides comprehensive documentation on using the command-line utility
 * **[Python Integration Guide](Python-Integration)** — Running netpipe as a subprocess, NDJSON schemas, and real-time script recipes.
 * **[Python Examples Reference](Python-Examples)** — Reference for all 22 numbered Python example scripts plus the smoke-test runner (intrusion detection, visualizations, reassembly).
 
+### Project Status
+* **[Open Issues](Open-Issues)** — Single source of truth for unresolved bugs, tech-debt, and known limitations.  After the v0.1.2 bug-fix pass, only 13 issues remain open — all tech-debt, known-limitations, or feature gaps.  **All `bug`-tagged items are now closed** (8 in v0.1.1 + 22 in v0.1.2).
+
 ---
 
 ## Quick Start (CLI)

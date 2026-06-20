@@ -63,6 +63,10 @@ Each packet is a Python dict. That's it — simple, composable, powerful.
 | `24_lua_pipeline.py` | Execute dynamic Lua scripts from Python for inline processing | ❌ |
 | `25_protocol_stats.py` | Aggregate and chart traffic protocol distribution metrics | ❌ |
 | `26_pcap_diff.py` | Side-by-side diffing of protocol signatures between two PCAPs | ❌ |
+| `27_pool_stats_monitor.py` | Monitor bufpool hit rate — validates np_bufpool wiring (Fix #7 + W1) | ✅ live / ❌ file |
+| `28_tls_decrypt_pipeline.py` | End-to-end TLS decryption & HTTP extraction from keylogged traffic | ❌ |
+| `29_dns_exfil_ips.py` | Python-side DNS exfiltration detector — SIEM-friendly alert format | ✅ live / ❌ file |
+| `30_registry_explorer.py` | Explore the plugin registry — list sinks, sources, extension mappings | ❌ |
 | `test_all_examples.py` | Smoke-test runner — verifies all examples run without crashing | ❌ |
 
 ---
@@ -136,6 +140,18 @@ python3 25_protocol_stats.py
 
 # 26. Packet-level protocol stack and signature comparison
 python3 26_pcap_diff.py
+
+# 27. Monitor bufpool hit rate (validates np_bufpool wiring)
+sudo python3 27_pool_stats_monitor.py -i wlo1 -c 1000
+
+# 28. TLS decryption pipeline — extract HTTP from keylogged traffic
+python3 28_tls_decrypt_pipeline.py -r encrypted_traffic.pcap -k tls_keys.log --extract-hosts
+
+# 29. DNS exfil IPS — pipe live DNS to a Python-side detector
+sudo ./build/bin/netpipe -i wlo1 -proto dns -fmt json -q | python3 29_dns_exfil_ips.py
+
+# 30. Explore the plugin registry
+python3 30_registry_explorer.py
 ```
 
 ---

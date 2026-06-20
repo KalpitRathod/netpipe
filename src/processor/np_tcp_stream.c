@@ -59,6 +59,11 @@
 #define TCP_FLOW_GC_INTERVAL_MS  5000   /* run GC every 5 s             */
 #define TCP_FLOW_LINGER_MS       10000  /* keep CLOSED flow 10 s        */
 
+/* FIX (issue: hardcoded limits): per-instance tunable accessors are
+ * declared here but defined AFTER the tcp_stream_ctx_t typedef below.
+ * (Forward-declared via an extern inline prototype; the actual body
+ * is at the end of the file's struct section.) */
+
 #define TCP_FIN  0x01
 #define TCP_SYN  0x02
 #define TCP_RST  0x04
@@ -233,7 +238,25 @@ typedef struct {
     int              nflows;
     uint64_t         total_streams;   /* lifetime count, for stats    */
     struct timespec  last_gc;         /* last GC sweep                 */
+
+    /* FIX (issue: hardcoded TCP_MAX_STREAM_BYTES / TCP_HOLE_TIMEOUT_MS):
+     * tunable per-instance limits set by np_processor_tcp_stream_ex().
+     * Zero means "use the historical default". */
+    size_t           max_stream_bytes;
+    uint32_t         hole_timeout_ms;
 } tcp_stream_ctx_t;
+
+/* FIX (issue: hardcoded limits): per-instance tunable accessors.  When
+ * the caller passed 0 to np_processor_tcp_stream_ex() (or used the
+ * backwards-compatible wrapper), fall back to the historical default. */
+static inline size_t tcp_max_stream_bytes(const tcp_stream_ctx_t *ctx) {
+    return ctx && ctx->max_stream_bytes ? ctx->max_stream_bytes
+                                        : (size_t)TCP_MAX_STREAM_BYTES;
+}
+static inline uint32_t tcp_hole_timeout_ms(const tcp_stream_ctx_t *ctx) {
+    return ctx && ctx->hole_timeout_ms ? ctx->hole_timeout_ms
+                                       : (uint32_t)TCP_HOLE_TIMEOUT_MS;
+}
 
 /* ------------------------------------------------------------------ */
 /*  Small helpers                                                       */
@@ -308,15 +331,16 @@ static void dir_free(tcp_direction_t *d)
  * gets as much data as possible), but the error code signals that
  * data was dropped. */
 static np_err_t dir_append_stream(tcp_direction_t *d,
-                                   const uint8_t *data, size_t len)
+                                   const uint8_t *data, size_t len,
+                                   size_t max_stream_bytes)
 {
     if (len == 0) return NP_OK;
 
     if (d->stream_len + len > d->stream_cap) {
         size_t new_cap = d->stream_cap == 0 ? 4096 : d->stream_cap;
         while (new_cap < d->stream_len + len) new_cap *= 2;
-        if (new_cap > TCP_MAX_STREAM_BYTES) {
-            new_cap = TCP_MAX_STREAM_BYTES;
+        if (new_cap > max_stream_bytes) {
+            new_cap = max_stream_bytes;
         }
         uint8_t *nb = realloc(d->stream, new_cap);
         if (!nb) return NP_ERR_NOMEM;
@@ -330,11 +354,11 @@ static np_err_t dir_append_stream(tcp_direction_t *d,
     d->stat_bytes_delivered += copyable;
 
     /* Bug 5 fix: if we couldn't copy all the data (stream buffer is at
-     * the 1 MiB cap), log a warning and return an error so the caller
-     * knows data was truncated. */
+     * the cap), log a warning and return an error so the caller knows
+     * data was truncated. */
     if (copyable < len) {
-        NP_LOG_WARN("tcp_stream: stream buffer full (cap=%d), truncated %zu of %zu bytes",
-                    TCP_MAX_STREAM_BYTES, len - copyable, len);
+        NP_LOG_WARN("tcp_stream: stream buffer full (cap=%zu), truncated %zu of %zu bytes",
+                    max_stream_bytes, len - copyable, len);
         return NP_ERR_NOMEM;
     }
     return NP_OK;
@@ -377,8 +401,17 @@ static np_err_t dir_insert_seg(tcp_direction_t *d,
     if (d->next_seq_set && len > 0) {
         int32_t lead = seq_delta(seq, d->next_seq);
         if (lead < 0) {
-            /* seg starts before next_seq — clip head. */
-            uint32_t clip = (uint32_t)(-lead);
+            /* seg starts before next_seq — clip head.
+             *
+             * Bug B7 fix: avoid `(-lead)` because it's signed-integer
+             * overflow (UB) when lead == INT32_MIN.  Compute the clip
+             * distance in unsigned arithmetic instead: the distance
+             * from `seq` backwards to `next_seq` is exactly
+             * `d->next_seq - seq` (unsigned wrap gives the right value
+             * because seq is strictly behind next_seq in the signed
+             * sense).  This is also what RFC 793 §3.2 recommends
+             * ("sequence numbers are unsigned"). */
+            uint32_t clip = d->next_seq - seq;
             if (clip >= (uint32_t)len) {
                 /* entirely consumed */
                 d->stat_retransmits++;
@@ -524,8 +557,11 @@ static np_err_t dir_insert_seg(tcp_direction_t *d,
 /*  incremented.                                                        */
 /* ------------------------------------------------------------------ */
 
-static void dir_drain(tcp_direction_t *d, uint64_t now)
+static void dir_drain(tcp_direction_t *d, uint64_t now,
+                      const tcp_stream_ctx_t *ctx)
 {
+    size_t   max_stream_bytes = tcp_max_stream_bytes(ctx);
+    uint32_t hole_timeout     = tcp_hole_timeout_ms(ctx);
     for (;;) {
         tcp_seg_t *s = d->segs;
         if (!s) break;
@@ -541,7 +577,8 @@ static void dir_drain(tcp_direction_t *d, uint64_t now)
         if (lead == 0) {
             /* In order — consume. */
             size_t seg_len = s->len;
-            np_err_t e = dir_append_stream(d, s->data, s->len);
+            np_err_t e = dir_append_stream(d, s->data, s->len,
+                                            max_stream_bytes);
             if (e != NP_OK) {
                 /* Bug H2 fix: dir_append_stream returned NP_ERR_NOMEM,
                  * meaning the stream buffer hit the 1 MiB cap and only
@@ -597,7 +634,7 @@ static void dir_drain(tcp_direction_t *d, uint64_t now)
                     d->next_seq += (uint32_t)stored;
                     memmove(s->data, s->data + stored, seg_len - stored);
                     s->seq += (uint32_t)stored;
-                    s->len -= stored;
+                    s->len -= (uint32_t)stored;
                     /* Don't free s; leave it at the head of the queue. */
                     break;
                 }
@@ -616,8 +653,12 @@ static void dir_drain(tcp_direction_t *d, uint64_t now)
 
         if (lead < 0) {
             /* s->seq is behind next_seq — should have been clipped
-             * during insertion, but defensively consume the head. */
-            uint32_t skip = (uint32_t)(-lead);
+             * during insertion, but defensively consume the head.
+             *
+             * Bug B7 fix (same as in dir_insert_seg above): compute the
+             * skip distance in unsigned arithmetic to avoid signed-integer
+             * overflow when lead == INT32_MIN. */
+            uint32_t skip = d->next_seq - s->seq;
             if (skip >= s->len) {
                 d->segs = s->next;
                 d->nsegs--;
@@ -634,7 +675,7 @@ static void dir_drain(tcp_direction_t *d, uint64_t now)
         if (!d->hole_open) {
             d->hole_open = true;
             d->hole_open_ms = now;
-        } else if (now - d->hole_open_ms >= TCP_HOLE_TIMEOUT_MS) {
+        } else if (now - d->hole_open_ms >= hole_timeout) {
             NP_LOG_INFO("tcp_stream: flushing gap of %d bytes in dir=%p",
                         lead, (void*)d);
             d->next_seq = s->seq;
@@ -668,6 +709,12 @@ static void dir_drain(tcp_direction_t *d, uint64_t now)
 /*  Hash table lookup / insert                                          */
 /* ------------------------------------------------------------------ */
 
+/* FIX: silence the -Wunused-function warning.  ctx_lookup is defined
+ * for completeness (parallel to ctx_lookup_or_create) but only the
+ * _or_create variant is currently called.  Mark it unused so the build
+ * is clean under -Wall -Wextra -Wpedantic; if a future caller needs
+ * lookup-without-create, the function is already there. */
+__attribute__((unused))
 static tcp_direction_t *ctx_lookup(tcp_stream_ctx_t *ctx,
                                     const tcp_flow_key_t *k)
 {
@@ -716,7 +763,15 @@ static void ctx_gc(tcp_stream_ctx_t *ctx, uint64_t now)
             uint64_t age = now - ((uint64_t)d->last_seen.tv_sec * 1000u +
                                   (uint64_t)d->last_seen.tv_nsec / 1000000u);
             bool closed  = (d->state == TCP_ST_CLOSED);
-            bool stalled = (d->nsegs == 0 && age > TCP_FLOW_LINGER_MS * 4);
+            /* Bug B9 fix: also evict directions that have a stuck
+             * out-of-order queue.  The old code only treated a direction
+             * as "stalled" if nsegs == 0, which meant a half-open
+             * connection that received out-of-order segments (filling
+             * the queue up to TCP_MAX_SEG_PER_FLOW = 256) and then
+             * vanished without FIN/RST was never evicted — a slow
+             * memory leak.  Now any direction older than
+             * TCP_FLOW_LINGER_MS * 4 is evicted regardless of nsegs. */
+            bool stalled = (age > (uint64_t)TCP_FLOW_LINGER_MS * 4);
             if ((closed && age > TCP_FLOW_LINGER_MS) || stalled) {
                 *pp = d->next;
                 dir_free(d);
@@ -903,7 +958,7 @@ static np_err_t tcp_stream_process(np_processor_t *p, np_packet_t *pkt)
     }
 
     /* Drain any segments that are now in-order. */
-    dir_drain(d, now);
+    dir_drain(d, now, ctx);
 
 after_drain:
     /* Periodic GC. */
@@ -953,11 +1008,31 @@ static const struct np_processor_ops tcp_stream_ops = {
 
 np_processor_t *np_processor_tcp_stream(void)
 {
+    return np_processor_tcp_stream_ex(0, 0);
+}
+
+np_processor_t *np_processor_tcp_stream_ex(size_t max_stream_bytes,
+                                            uint32_t hole_timeout_ms)
+{
     np_processor_t *p = calloc(1, sizeof(*p));
     if (!p) return NULL;
 
     tcp_stream_ctx_t *ctx = calloc(1, sizeof(*ctx));
     if (!ctx) { free(p); return NULL; }
+
+    /* FIX (issue: hardcoded TCP_MAX_STREAM_BYTES / TCP_HOLE_TIMEOUT_MS):
+     * store the caller-supplied values; the accessor functions fall
+     * back to the historical defaults when these are 0. */
+    ctx->max_stream_bytes = max_stream_bytes;
+    ctx->hole_timeout_ms  = hole_timeout_ms;
+    if (max_stream_bytes != 0) {
+        NP_LOG_INFO("tcp_stream: per-flow cap = %zu bytes (default 1 MiB)",
+                    max_stream_bytes);
+    }
+    if (hole_timeout_ms != 0) {
+        NP_LOG_INFO("tcp_stream: hole-flush timeout = %u ms (default 1000)",
+                    hole_timeout_ms);
+    }
 
     p->ops  = &tcp_stream_ops;
     p->priv = ctx;

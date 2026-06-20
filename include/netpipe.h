@@ -356,6 +356,32 @@ np_packet_t *np_packet_clone(const np_packet_t *src);
  */
 void np_packet_ts_str(const np_packet_t *pkt, char *buf, size_t bufsz);
 
+/**
+ * np_packet_app_layer_is_decrypted() - returns true if the application
+ * layer pointer (pkt->app->data) has been redirected from the original
+ * packet raw buffer to a heap-allocated decrypted-plaintext buffer.
+ *
+ * FIX (issue: np_processor_tls_decrypt mutates pkt->layers[i].data in
+ * place to point at decrypted plaintext — a subtle aliasing invariant
+ * that np_packet_clone had to be taught to handle):
+ *   This function lets downstream code (processors, sinks, scripts)
+ *   detect the aliasing explicitly instead of having to compare
+ *   pkt->app->data against [pkt->raw, pkt->raw+pkt->caplen) by hand.
+ *   Code that needs the ORIGINAL (encrypted) bytes can use
+ *   np_packet_original_app_layer() below.
+ */
+bool np_packet_app_layer_is_decrypted(const np_packet_t *pkt);
+
+/**
+ * np_packet_original_app_layer() - if the application layer has been
+ * redirected to a decrypted plaintext buffer, return a pointer to the
+ * ORIGINAL (encrypted) bytes inside pkt->raw; otherwise return
+ * pkt->app->data unchanged.  Output length is written to *out_len.
+ * Returns NULL if the packet has no app layer.
+ */
+const uint8_t *np_packet_original_app_layer(const np_packet_t *pkt,
+                                             size_t *out_len);
+
 /* ------------------------------------------------------------------ */
 /*  Pipeline context                                                    */
 /* ------------------------------------------------------------------ */
@@ -420,8 +446,22 @@ np_source_t *np_source_file(const char *path);
  * np_source_ring() - create a high-throughput live source using AF_PACKET + PACKET_MMAP.
  * Maps the kernel RX ring directly into user-space; avoids per-packet syscalls.
  * Requires CAP_NET_RAW or root.  Returns NULL on error.
+ *
+ * FIX (issues: ETH_P_ALL by default + hardcoded ring size):
+ *   @eth_proto    EtherType to capture, in HOST byte order.  Pass
+ *                 0x0003 (ETH_P_ALL) to capture every protocol on the
+ *                 wire.  Use 0x0800 (IPv4), 0x86DD (IPv6), or 0x0806
+ *                 (ARP) to restrict the kernel-side filter and cut
+ *                 down on user-space processing of unwanted frames.
+ *   @ring_blocks  Number of 1 MiB blocks in the PACKET_RX_RING ring
+ *                 buffer.  0 selects the default (8 = 8 MiB).
+ *                 Larger rings tolerate larger traffic bursts but
+ *                 consume more memory and take longer to drain on
+ *                 shutdown.
  */
-np_source_t *np_source_ring(const char *device);
+np_source_t *np_source_ring(const char *device,
+                             uint16_t eth_proto,
+                             int      ring_blocks);
 
 /**
  * np_source_free() - release a source that was NOT added to a pipeline.
@@ -429,6 +469,27 @@ np_source_t *np_source_ring(const char *device);
  * do NOT call this on them.
  */
 void         np_source_free(np_source_t *src);
+
+/**
+ * np_source_set_kernel_bpf() - install a BPF filter on the underlying
+ * capture handle (libpcap sources only) so the kernel drops non-matching
+ * packets BEFORE they cross the kernel/user boundary.
+ *
+ * FIX (issue: BPF filters were run in user-space via bpf_filter()
+ * instead of being compiled into the kernel via pcap_setfilter()):
+ * calling this is strictly an optimization — semantically equivalent
+ * to adding np_filter_bpf() to the pipeline, but avoids the per-packet
+ * kernel→user memory copy for packets that would be filtered out.
+ * On a high-traffic interface this can reduce CPU usage by orders of
+ * magnitude (e.g. "tcp port 80" on a 10 Gbps mirror typically drops
+ * 99%+ of frames in the kernel).
+ *
+ * Must be called BEFORE np_pipeline_run().  Returns NP_OK on success,
+ * NP_ERR_FILTER on compile error (bad expression), or NP_ERR_GENERIC
+ * on installation failure.  Sources that don't support kernel-side BPF
+ * (e.g. np_source_ring) return NP_ERR_PROTO without modifying state.
+ */
+np_err_t     np_source_set_kernel_bpf(np_source_t *src, const char *expr);
 
 /** np_pipeline_add_source() - attach src to pl.  pl takes ownership of src. */
 np_err_t     np_pipeline_add_source(np_pipeline_t *pl, np_source_t *src);
@@ -505,7 +566,23 @@ np_processor_t *np_processor_fn(np_proc_fn fn, void *userdata);
  * np_processor_tcp_stream() - TCP stream reassembly processor.
  * Tracks sequence numbers, reconstructs fragmented payloads, and
  * populates pkt->stream_data / pkt->stream_len for matched flows.
+ *
+ * FIX (issue: hardcoded TCP_MAX_STREAM_BYTES / TCP_HOLE_TIMEOUT_MS):
+ *   @max_stream_bytes  Per-flow cap on the reassembled byte stream.
+ *                      0 selects the default (1 MiB).  A long-lived
+ *                      HTTP connection streaming more than this is
+ *                      silently truncated; raise the cap if you need
+ *                      the full stream.
+ *   @hole_timeout_ms   Gap-flush timeout.  0 selects the default
+ *                      (1000 ms).  If a gap persists longer than this,
+ *                      the reassembler advances next_seq to the next
+ *                      queued segment so lossy links make forward
+ *                      progress instead of blocking forever.
  */
+np_processor_t *np_processor_tcp_stream_ex(size_t max_stream_bytes,
+                                            uint32_t hole_timeout_ms);
+
+/** Backwards-compatible wrapper: defaults (1 MiB stream, 1 s hole timeout). */
 np_processor_t *np_processor_tcp_stream(void);
 
 /**
@@ -530,15 +607,40 @@ np_processor_t *np_processor_payload_transform(const char *mode,
  * np_processor_flow_tracker() - five-tuple flow association processor.
  * Assigns pkt->flow_id based on (src_ip, dst_ip, src_port, dst_port, proto)
  * and maintains per-flow state accessible via user_data.
+ *
+ * FIX (issue: hardcoded FLOW_MAX_ENTRIES / FLOW_IDLE_TIMEOUT_S):
+ *   @max_entries     Hard cap on the number of tracked flows.  0
+ *                    selects the default (1,000,000).  Above the cap,
+ *                    new flows are dropped (with a counter) to prevent
+ *                    SYN-flood OOM.  Lower this for memory-constrained
+ *                    sensors; raise it for very large segments.
+ *   @idle_timeout_s  Evict flows idle for this many seconds.  0
+ *                    selects the default (60 s).
  */
+np_processor_t *np_processor_flow_tracker_ex(uint32_t max_entries,
+                                              uint32_t idle_timeout_s);
+
+/** Backwards-compatible wrapper: defaults (1M flows, 60 s idle). */
 np_processor_t *np_processor_flow_tracker(void);
 
 /**
  * np_processor_lua() - load and execute a Lua 5.4 script per packet.
  * script_path must be readable; the Lua global 'pkt' is a table of
  * the packet's decoded fields.  Returns NULL if the script fails to load.
+ *
+ * FIX (issue: hardcoded NP_LUA_MEM_LIMIT):
+ *   Use np_processor_lua_ex() to override the 16 MiB default Lua VM
+ *   memory cap.  Scripts can also query the cap at runtime via the
+ *   np_mem_stats() Lua binding.
  */
 np_processor_t *np_processor_lua(const char *script_path);
+
+/**
+ * np_processor_lua_ex() - like np_processor_lua but with a custom VM
+ * memory cap.  @mem_limit_bytes of 0 selects the default (16 MiB).
+ */
+np_processor_t *np_processor_lua_ex(const char *script_path,
+                                     size_t mem_limit_bytes);
 
 /**
  * np_processor_tls_decrypt() - TLS session decryption processor.

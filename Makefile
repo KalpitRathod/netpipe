@@ -38,6 +38,7 @@ MANPATH  := $(PREFIX)/share/man
 SRCS := \
 	$(SRCDIR)/main.c \
 	$(SRCDIR)/np_global.c \
+	$(SRCDIR)/np_registry_builtin.c \
 	$(SRCDIR)/log/np_log.c \
 	$(SRCDIR)/packet/np_packet.c \
 	$(SRCDIR)/bufpool/np_bufpool.c \
@@ -65,16 +66,47 @@ LIB_OBJS := $(patsubst %.c, $(OBJDIR)/%.o, $(LIB_SRCS))
 # ------------------------------------------------------------------ #
 #  Lua Configuration                                                  #
 # ------------------------------------------------------------------ #
+#
+# FIX (issue: link fails on Debian/Ubuntu because liblua5.4-dev
+# installs liblua5.4.so, not liblua.so — so `-llua` can't find it).
+#
+# Detection order:
+#   1. Vendored lua-5.4.7/ tree (if present) — statically linked.
+#   2. pkg-config lua5.4  (Debian/Ubuntu: liblua5.4-dev provides this)
+#   3. pkg-config lua     (some distros ship a generic .pc file)
+#   4. Manual -llua5.4 -I/usr/include/lua5.4  (fallback if no pkg-config)
+#   5. Manual -llua                            (older distros, no version suffix)
 
 LUA_LOCAL_DIR  := $(CURDIR)/lua-5.4.7/install
 LUA_STATIC_LIB := $(LUA_LOCAL_DIR)/lib/liblua.a
 
-# Check if the vendored Lua source directory exists in the repo
 ifneq ($(wildcard lua-5.4.7/Makefile),)
+    # Vendored Lua — static link
     LUA_CFLAGS  := -I$(LUA_LOCAL_DIR)/include
     LUA_LDFLAGS := $(LUA_STATIC_LIB) -lm -ldl
     LUA_DEP     := $(LUA_STATIC_LIB)
+else ifneq ($(shell pkg-config --exists lua5.4 && echo yes),)
+    # Debian/Ubuntu: liblua5.4-dev provides lua5.4.pc
+    LUA_CFLAGS  := $(shell pkg-config --cflags lua5.4)
+    LUA_LDFLAGS := $(shell pkg-config --libs lua5.4) -lm -ldl
+    LUA_DEP     :=
+else ifneq ($(shell pkg-config --exists lua && echo yes),)
+    # Generic lua.pc (Arch Linux, some BSDs)
+    LUA_CFLAGS  := $(shell pkg-config --cflags lua)
+    LUA_LDFLAGS := $(shell pkg-config --libs lua) -lm -ldl
+    LUA_DEP     :=
+else ifneq ($(wildcard /usr/include/lua5.4/lua.h),)
+    # Fallback: headers in /usr/include/lua5.4/, lib name liblua5.4
+    LUA_CFLAGS  := -I/usr/include/lua5.4
+    LUA_LDFLAGS := -llua5.4 -lm -ldl
+    LUA_DEP     :=
+else ifneq ($(wildcard /usr/include/lua5.3/lua.h),)
+    # Fallback: Lua 5.3 headers (compatible enough for netpipe)
+    LUA_CFLAGS  := -I/usr/include/lua5.3
+    LUA_LDFLAGS := -llua5.3 -lm -ldl
+    LUA_DEP     :=
 else
+    # Last resort: assume generic -llua (older distros, Homebrew, etc.)
     LUA_CFLAGS  :=
     LUA_LDFLAGS := -llua -lm -ldl
     LUA_DEP     :=
@@ -209,7 +241,7 @@ fuzz: $(STATIC)
 	@mkdir -p $(BINDIR) fuzz-out
 	@echo "  LD  $(FUZZ_BIN)"
 	$(FUZZ_CC) $(FUZZ_CFLAGS) tests/fuzz_demux.c \
-	        -o $(FUZZ_BIN) $(STATIC) $(LDFLAGS) -fsanitize=address,undefined
+		-o $(FUZZ_BIN) $(STATIC) $(LDFLAGS) -fsanitize=address,undefined
 	@echo "  ✓  fuzz harness built → $(FUZZ_BIN)"
 	@echo "  Run: afl-fuzz -i tests/fixtures/ -o fuzz-out/ -- $(FUZZ_BIN)"
 	@echo "  Or:  $(FUZZ_BIN) < tests/fixtures/ipv4_tcp_http.pcap"
@@ -218,9 +250,9 @@ fuzz-libfuzzer: $(STATIC)
 	@mkdir -p $(BINDIR) fuzz-out
 	@echo "  LD  $(BINDIR)/fuzz_demux_libfuzzer  (libFuzzer)"
 	clang $(FUZZ_CFLAGS) -DLIBFUZZER -fsanitize=fuzzer \
-	        tests/fuzz_demux.c \
-	        -o $(BINDIR)/fuzz_demux_libfuzzer \
-	        $(STATIC) $(LDFLAGS)
+		tests/fuzz_demux.c \
+		-o $(BINDIR)/fuzz_demux_libfuzzer \
+		$(STATIC) $(LDFLAGS)
 	@echo "  ✓  libFuzzer harness built → $(BINDIR)/fuzz_demux_libfuzzer"
 	@echo "  Run: $(BINDIR)/fuzz_demux_libfuzzer tests/fixtures/"
 
@@ -293,8 +325,8 @@ uninstall:
 clean:
 	rm -rf $(BUILDDIR)
 	@if [ -d lua-5.4.7 ]; then \
-	        $(MAKE) -C lua-5.4.7 clean >/dev/null 2>&1 || true; \
-	        rm -rf lua-5.4.7/install; \
+		$(MAKE) -C lua-5.4.7 clean >/dev/null 2>&1 || true; \
+		rm -rf lua-5.4.7/install; \
 	fi
 	@echo "  cleaned"
 
@@ -304,10 +336,10 @@ clean:
 
 check: release
 	@if [ -f test/sample.pcap ]; then \
-	        echo "  Running on test/sample.pcap ..."; \
-	        $(BIN) -r test/sample.pcap -fmt hex 2>/dev/null | head -30; \
+		echo "  Running on test/sample.pcap ..."; \
+		$(BIN) -r test/sample.pcap -fmt hex 2>/dev/null | head -30; \
 	else \
-	        echo "  No test/sample.pcap found — skipping functional test."; \
+		echo "  No test/sample.pcap found — skipping functional test."; \
 	fi
 
 # ------------------------------------------------------------------ #
@@ -338,7 +370,7 @@ deb: release
 	install -m 644 mitigate.lua test.lua $(DEB_ROOT)/usr/share/netpipe/lua/
 	install -d $(DEB_ROOT)/usr/share/doc/netpipe
 	install -m 644 README.md LICENSE RELEASE_NOTES.md \
-	        $(DEB_ROOT)/usr/share/doc/netpipe/
+		$(DEB_ROOT)/usr/share/doc/netpipe/
 	install -d $(DEB_ROOT)/DEBIAN
 	install -m 644 packaging/deb/control $(DEB_ROOT)/DEBIAN/control
 	install -m 755 packaging/deb/postinst $(DEB_ROOT)/DEBIAN/postinst

@@ -278,12 +278,14 @@ static int dns_read_name(const uint8_t *payload, size_t len, size_t offset, char
     size_t out_idx = 0;
     size_t og_offset = offset;
     bool jumped = false;
+    bool terminated = false;   /* Bug B1 fix: only true when we hit a 0-byte terminator */
     int jumps = 0;
-    
+
     while (offset < len) {
         uint8_t l = payload[offset];
         if (l == 0) {
             if (!jumped) og_offset = offset + 1;
+            terminated = true;
             break;
         }
         if ((l & 0xC0) == 0xC0) {
@@ -296,12 +298,12 @@ static int dns_read_name(const uint8_t *payload, size_t len, size_t offset, char
             if (jumps > 5) return -1; /* avoid loops */
             continue;
         }
-        
+
         offset++;
         if (offset + l > len) return -1;
-        
+
         if (out_idx > 0 && out_idx < out_max) out[out_idx++] = '.';
-        
+
         for (int i = 0; i < l; i++) {
             if (out_idx < out_max - 1) {
                 out[out_idx++] = (char)payload[offset + (size_t)i];
@@ -310,7 +312,14 @@ static int dns_read_name(const uint8_t *payload, size_t len, size_t offset, char
         offset += l;
         if (!jumped) og_offset = offset;
     }
-    
+
+    /* Bug B1 fix: if the loop exited because offset >= len WITHOUT
+     * hitting a 0-byte terminator, the name was truncated.  Return -1
+     * instead of og_offset so callers know parsing failed.  Previously
+     * the function returned og_offset (a positive value), which callers
+     * interpreted as success and continued parsing from a bogus offset. */
+    if (!terminated) return -1;
+
     if (out_idx < out_max) out[out_idx] = '\0';
     return (int)og_offset;
 }
@@ -348,12 +357,20 @@ static void decode_dns(np_packet_t *pkt, np_layer_t *layer)
     }
     
     for (int i = 0; i < ancount && msg->num_answers < NP_MAX_DNS_ANSWERS && offset < len; i++) {
-        np_dns_answer_t *ans = &msg->answers[msg->num_answers++];
-        
+        /* Bug B2 fix: take a pointer to the SLOT BEFORE incrementing
+         * num_answers, so a parse failure mid-answer doesn't leave a
+         * phantom empty entry counted.  The old code did
+         *   `&msg->answers[msg->num_answers++]`
+         * which increments unconditionally — if dns_read_name or any
+         * subsequent bounds check failed, num_answers had already been
+         * bumped, leaving a zero-initialized entry that downstream
+         * consumers would iterate as a valid (but empty) answer. */
+        np_dns_answer_t *ans = &msg->answers[msg->num_answers];
+
         int next_off = dns_read_name(p, len, offset, ans->name, sizeof(ans->name));
         if (next_off < 0) break;
         offset = (size_t)next_off;
-        
+
         if (offset + 10 > len) break;
         ans->type = (uint16_t)(((uint16_t)p[offset] << 8) | p[offset + 1]);
         ans->class_ = (uint16_t)(((uint16_t)p[offset + 2] << 8) | p[offset + 3]);
@@ -361,9 +378,9 @@ static void decode_dns(np_packet_t *pkt, np_layer_t *layer)
                    ((uint32_t)p[offset + 6] << 8)  |  (uint32_t)p[offset + 7];
         ans->data_len = (uint16_t)(((uint16_t)p[offset + 8] << 8) | p[offset + 9]);
         offset += 10;
-        
+
         if (offset + ans->data_len > len) break;
-        
+
         if (ans->type == 1 && ans->data_len == 4) {
             snprintf(ans->rdata_str, sizeof(ans->rdata_str), "%u.%u.%u.%u",
                      p[offset], p[offset+1], p[offset+2], p[offset+3]);
@@ -379,8 +396,11 @@ static void decode_dns(np_packet_t *pkt, np_layer_t *layer)
         } else {
             snprintf(ans->rdata_str, sizeof(ans->rdata_str), "<type %d>", ans->type);
         }
-        
+
         offset += ans->data_len;
+        /* Bug B2 fix: only now that the full answer has been parsed do
+         * we commit it by incrementing num_answers. */
+        msg->num_answers++;
     }
     
     layer->decoded = msg;
@@ -389,6 +409,10 @@ static void decode_dns(np_packet_t *pkt, np_layer_t *layer)
 static bool looks_like_http(const uint8_t *payload, size_t len)
 {
     if (len < 8) return false;
+    /* Bug #15 fix: expanded the HTTP method dictionary to include all
+     * RFC 9110 §9 methods.  The original code only checked GET/POST/PUT;
+     * v0.1.0 added HEAD/DELETE/OPTIONS/PATCH; v0.1.2 adds CONNECT and
+     * TRACE so all standard methods are now recognised. */
     /* request */
     if (memcmp(payload, "GET ",     4) == 0) return true;
     if (memcmp(payload, "POST ",    5) == 0) return true;
@@ -397,6 +421,8 @@ static bool looks_like_http(const uint8_t *payload, size_t len)
     if (memcmp(payload, "DELETE ",  7) == 0) return true;
     if (memcmp(payload, "OPTIONS ", 8) == 0) return true;
     if (memcmp(payload, "PATCH ",   6) == 0) return true;
+    if (memcmp(payload, "CONNECT ", 8) == 0) return true;
+    if (memcmp(payload, "TRACE ",   6) == 0) return true;
     /* response */
     if (memcmp(payload, "HTTP/",    5) == 0) return true;
     return false;
@@ -448,6 +474,19 @@ static bool looks_like_tls(const uint8_t *payload, size_t len)
         }
         if (!hs_ok) return false;
     }
+
+    /* Bug #16 follow-up (B4): minimum payload-length checks for non-handshake
+     * record types.  Without these, the heuristic accepts any random TCP
+     * payload whose first 3 bytes happen to match the content-type + version
+     * magic.  Each TLS record type has a minimum meaningful payload size:
+     *   - ChangeCipherSpec (20): exactly 1 byte (the value 0x01).
+     *   - Alert (21): at least 2 bytes (alert level + alert description).
+     *   - ApplicationData (23): at least 16 bytes (AEAD auth tag for GCM).
+     * Rejecting records that fall short of these minimums eliminates most
+     * false-positive hits on raw binary TCP streams. */
+    if (ct == 20 && rlen != 1) return false;       /* CCS must be exactly 1 byte */
+    if (ct == 21 && rlen < 2) return false;        /* Alert: level + description */
+    if (ct == 23 && rlen < 16) return false;       /* AppData: at least an AEAD tag */
 
     return true;
 }
@@ -503,9 +542,21 @@ static void decode_http(np_packet_t *pkt, np_layer_t *layer)
             
             const uint8_t *sp2 = find_char(sp1 + 1, line_len - (size_t)(sp1 + 1 - p), ' ');
             if (sp2) {
+                /* Bug B3 fix: cap the digit count to 3 (HTTP status codes
+                 * are 3-digit per RFC 9110 §15) and break early.  The old
+                 * code accumulated digits without bound, so a malformed
+                 * response with a 20-digit "status code" would overflow
+                 * the int accumulator (signed-integer overflow = UB). */
                 int code = 0;
-                for (const uint8_t *c = sp1 + 1; c < sp2; c++) {
-                    if (*c >= '0' && *c <= '9') code = code * 10 + (*c - '0');
+                int digits = 0;
+                for (const uint8_t *c = sp1 + 1; c < sp2 && digits < 3; c++, digits++) {
+                    if (*c >= '0' && *c <= '9') {
+                        code = code * 10 + (*c - '0');
+                    } else {
+                        /* Non-digit in the status field — stop parsing. */
+                        code = 0;
+                        break;
+                    }
                 }
                 msg->status_code = code;
                 msg->status_phrase.str = (const char *)(sp2 + 1);

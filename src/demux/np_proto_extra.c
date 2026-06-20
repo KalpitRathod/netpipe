@@ -127,14 +127,26 @@ static bool looks_like_mqtt(const uint8_t *p, size_t len,
     uint32_t rl = 0;
     int shift = 0;
     int n = 0;
+    bool rl_complete = false;   /* Bug B5 fix: track whether the variable-length
+                                 * integer was fully decoded (i.e. we hit a
+                                 * byte without the continuation bit set). */
     while (i < len && n < 4) {
         uint8_t b = p[i++];
         rl |= (uint32_t)(b & 0x7f) << shift;
         shift += 7;
         n++;
-        if ((b & 0x80) == 0) break;
+        if ((b & 0x80) == 0) {
+            rl_complete = true;
+            break;
+        }
     }
-    if (n == 4 && (p[i - 1] & 0x80) != 0) return false;  /* malformed */
+    /* Bug B5 fix: if the loop exited because we ran out of buffer (i < len
+     * became false) OR because we hit the 4-byte cap (n == 4) without
+     * seeing a terminating byte, the variable-length integer is truncated
+     * or malformed.  The old code returned true in this case, accepting
+     * truncated MQTT headers as valid.  Now we reject them. */
+    if (!rl_complete) return false;
+    if (n == 4 && (p[i - 1] & 0x80) != 0) return false;  /* malformed (redundant, kept for clarity) */
     if (rl == 0 && type != 12 /* PINGREQ */ && type != 13 /* PINGRESP */ &&
                     type != 14 /* DISCONNECT */) {
         /* Most other types carry a payload.  Not a strict rule, so just

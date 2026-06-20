@@ -28,4 +28,11 @@ uint32_t np_packet_flow_hash(const np_packet_t *pkt);
 
 /* np_packet_ts_str() is declared in <netpipe.h>. */
 
+/* FIX (issue: np_bufpool was never wired up): expose pool stats and
+ * teardown so the CLI/tests can verify the pool is being used and
+ * np_cleanup can destroy it cleanly.  Not part of the stable public
+ * ABI — internal symbol. */
+void np_packet_pool_stats(FILE *fp);
+void np_packet_pool_destroy(void);
+
 #endif /* NP_PACKET_H */

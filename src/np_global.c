@@ -7,6 +7,7 @@
 
 #include "netpipe.h"
 #include "log/np_log.h"
+#include "packet/np_packet.h"   /* FIX: np_packet_pool_destroy on cleanup */
 
 np_err_t np_init(void)
 {
@@ -18,6 +19,11 @@ np_err_t np_init(void)
 
 void np_cleanup(void)
 {
+    /* FIX (issue: np_bufpool was never wired up): destroy the process-
+     * global packet bufpool on cleanup so valgrind doesn't report it
+     * as a leak.  Must be called AFTER all pipelines are freed (which
+     * drops all packet references). */
+    np_packet_pool_destroy();
     NP_LOG_DEBUG("%s", "netpipe cleanup");
 }
 

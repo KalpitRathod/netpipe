@@ -142,6 +142,50 @@ static void np_lua_open_safe_libs(lua_State *L)
     lua_pushnil(L); lua_setglobal(L, "package");
 }
 
+/* FIX (issue: test.lua broken by sandbox):
+ * Expose a tiny `np_log(level, msg)` Lua binding so sandboxed scripts
+ * can route structured log lines through netpipe's leveled logger
+ * (timestamps, file:line, ANSI colours) instead of being forced to
+ * call `io.open()` — which the sandbox deliberately nils out.
+ *
+ * Usage from Lua:
+ *   np_log("trace" | "debug" | "info" | "warn" | "error", "message")
+ *
+ * Unknown levels default to INFO.  Returns true on success. */
+static int l_np_log(lua_State *L)
+{
+    const char *level = luaL_optstring(L, 1, "info");
+    const char *msg   = luaL_optstring(L, 2, "");
+    if (!strcasecmp(level, "trace"))      NP_LOG_TRACE("%s", msg);
+    else if (!strcasecmp(level, "debug")) NP_LOG_DEBUG("%s", msg);
+    else if (!strcasecmp(level, "info"))  NP_LOG_INFO("%s", msg);
+    else if (!strcasecmp(level, "warn"))  NP_LOG_WARN("%s", msg);
+    else if (!strcasecmp(level, "error")) NP_LOG_ERROR("%s", msg);
+    else                                  NP_LOG_INFO("%s", msg);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* FIX (issue: hardcoded NP_LUA_MEM_LIMIT):
+ * Expose the configured memory cap and current usage to Lua scripts so
+ * they can self-throttle large state tables before hitting the hard
+ * limit.  Returns (mem_used, mem_limit) in bytes. */
+static int l_np_mem_stats(lua_State *L)
+{
+    lua_getfield(L, LUA_REGISTRYINDEX, LUA_NETPIPE_PROC_KEY);
+    np_processor_t *proc = lua_touserdata(L, -1);
+    lua_pop(L, 1);
+    if (!proc || !proc->priv) {
+        lua_pushinteger(L, 0);
+        lua_pushinteger(L, 0);
+        return 2;
+    }
+    lua_priv_t *priv = proc->priv;
+    lua_pushinteger(L, (lua_Integer)priv->mem_used);
+    lua_pushinteger(L, (lua_Integer)priv->mem_limit);
+    return 2;
+}
+
 static int l_register_processor(lua_State *L)
 {
     // Retrieve the np_processor_t pointer from registry
@@ -505,6 +549,15 @@ static const struct np_processor_ops lua_processor_ops = {
 
 np_processor_t *np_processor_lua(const char *script_path)
 {
+    /* FIX (issue: hardcoded NP_LUA_MEM_LIMIT): the wrapper preserves the
+     * historical 16 MiB default.  Callers that need a different cap
+     * should use np_processor_lua_ex(). */
+    return np_processor_lua_ex(script_path, 0);
+}
+
+np_processor_t *np_processor_lua_ex(const char *script_path,
+                                     size_t mem_limit_bytes)
+{
     lua_priv_t *priv = calloc(1, sizeof(*priv));
     if (!priv) return NULL;
 
@@ -522,8 +575,12 @@ np_processor_t *np_processor_lua(const char *script_path)
     proc->priv = priv;
 
     // 1. Create Lua State (Bug LU1 fix: with custom memory-capping allocator)
-    priv->mem_limit = NP_LUA_MEM_LIMIT;
+    priv->mem_limit = (mem_limit_bytes > 0) ? mem_limit_bytes : NP_LUA_MEM_LIMIT;
     priv->mem_used  = 0;
+    if (mem_limit_bytes > 0 && mem_limit_bytes != NP_LUA_MEM_LIMIT) {
+        NP_LOG_INFO("lua: VM memory cap = %zu bytes (default %zu)",
+                    mem_limit_bytes, (size_t)NP_LUA_MEM_LIMIT);
+    }
     priv->L = lua_newstate(np_lua_alloc, priv);
     if (!priv->L) {
         NP_LOG_ERROR("%s", "failed to create Lua state");
@@ -540,6 +597,14 @@ np_processor_t *np_processor_lua(const char *script_path)
 
     // 3. Register NP_REGISTER_PROCESSOR global function
     lua_register(priv->L, "NP_REGISTER_PROCESSOR", l_register_processor);
+
+    // 3a. FIX (issue: test.lua broken by sandbox): expose np_log() so
+    // sandboxed scripts can write to netpipe's leveled logger without
+    // needing the (intentionally removed) `io` library.  Also expose
+    // np_mem_stats() so scripts can self-throttle against the
+    // configurable memory cap (see -lua-mem-limit CLI flag).
+    lua_register(priv->L, "np_log",       l_np_log);
+    lua_register(priv->L, "np_mem_stats", l_np_mem_stats);
 
     // 4. Store pointer to this processor in registry for use in the callback
     lua_pushlightuserdata(priv->L, proc);

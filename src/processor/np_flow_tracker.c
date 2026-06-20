@@ -12,6 +12,8 @@
 
 #define FLOW_BUCKETS 1024
 #define FLOW_MAX_ENTRIES 1000000   /* Bug FT2 fix: hard cap against SYN-flood OOM */
+#define FLOW_IDLE_TIMEOUT_S   60   /* evict flows idle > 60 s */
+#define FLOW_GC_INTERVAL      1024 /* sweep every 1024 packets */
 
 #pragma pack(push, 1)
 
@@ -98,10 +100,25 @@ typedef struct {
     uint64_t        total_flows;
     uint64_t        sweep_counter;   /* for periodic GC (Bug 2.1) */
     uint64_t        flows_dropped;   /* Bug FT2 fix: count flows rejected due to cap */
+
+    /* FIX (issue: hardcoded FLOW_MAX_ENTRIES / FLOW_IDLE_TIMEOUT_S):
+     * tunable per-instance limits set by np_processor_flow_tracker_ex().
+     * Zero means "use the historical default". */
+    uint32_t        max_entries;
+    uint32_t        idle_timeout_s;
 } flow_tracker_ctx_t;
 
-#define FLOW_IDLE_TIMEOUT_S   60   /* evict flows idle > 60 s */
 #define FLOW_GC_INTERVAL      1024 /* sweep every 1024 packets */
+
+/* FIX (issue: hardcoded limits): per-instance tunable accessors. */
+static inline uint32_t flow_max_entries(const flow_tracker_ctx_t *ctx) {
+    return ctx && ctx->max_entries ? ctx->max_entries
+                                   : (uint32_t)FLOW_MAX_ENTRIES;
+}
+static inline uint32_t flow_idle_timeout_s(const flow_tracker_ctx_t *ctx) {
+    return ctx && ctx->idle_timeout_s ? ctx->idle_timeout_s
+                                      : (uint32_t)FLOW_IDLE_TIMEOUT_S;
+}
 
 /* Helper to compare flow keys */
 static bool flow_key_match(const flow_key_t *a, const flow_key_t *b)
@@ -242,8 +259,8 @@ static void flow_tracker_free(np_processor_t *p)
     printf("Total tracked flows: \033[1;32m%lu\033[0m",
            (unsigned long)ctx->total_flows);
     if (ctx->flows_dropped > 0) {
-        printf("  (\033[1;31m%lu dropped due to %d-entry cap\033[0m)",
-               (unsigned long)ctx->flows_dropped, FLOW_MAX_ENTRIES);
+        printf("  (\033[1;31m%lu dropped due to %u-entry cap\033[0m)",
+               (unsigned long)ctx->flows_dropped, flow_max_entries(ctx));
     }
     printf("\n\n");
 
@@ -281,8 +298,10 @@ static np_err_t flow_tracker_process(np_processor_t *p, np_packet_t *pkt)
     flow_key_t key;
     memset(&key, 0, sizeof(key));
 
+    /* Bug: removed unused `is_ipv6` variable.  Both flags were computed
+     * but only `is_ipv4` is used below — the IPv6 branch is selected
+     * implicitly by `if (is_ipv4) ... else ...`. */
     bool is_ipv4 = (pkt->net->proto == NP_PROTO_IP4);
-    bool is_ipv6 = (pkt->net->proto == NP_PROTO_IP6);
 
     uint16_t src_port = 0;
     uint16_t dst_port = 0;
@@ -415,7 +434,7 @@ static np_err_t flow_tracker_process(np_processor_t *p, np_packet_t *pkt)
     /* Bug 2.1: periodic GC to evict idle flows and prevent unbounded
      * memory growth on long captures.  Every FLOW_GC_INTERVAL packets,
      * we sweep the current bucket (localized, cheap) and evict any flow
-     * whose last_seen is older than FLOW_IDLE_TIMEOUT_S.
+     * whose last_seen is older than the configured idle timeout.
      *
      * Bug 15 fix: use wall-clock time (time(NULL)) instead of the
      * packet's capture timestamp.  The old code used pkt->ts.tv_sec,
@@ -424,6 +443,8 @@ static np_err_t flow_tracker_process(np_processor_t *p, np_packet_t *pkt)
      * be evicted).  For live capture, using packet timestamps meant
      * GC stopped when traffic stopped.  Wall-clock time is correct
      * in both cases. */
+    uint32_t idle_to = flow_idle_timeout_s(ctx);   /* FIX: tunable */
+    uint32_t max_flows = flow_max_entries(ctx);    /* FIX: tunable */
     ctx->sweep_counter++;
     if ((ctx->sweep_counter % FLOW_GC_INTERVAL) == 0) {
         time_t now_sec = time(NULL);
@@ -432,7 +453,7 @@ static np_err_t flow_tracker_process(np_processor_t *p, np_packet_t *pkt)
         while (*pp) {
             flow_node_t *n = *pp;
             double age = difftime(now_sec, n->stats.last_seen.tv_sec);
-            if (age > (double)FLOW_IDLE_TIMEOUT_S) {
+            if (age > (double)idle_to) {
                 *pp = n->next;
                 free(n);
                 ctx->total_flows--;
@@ -458,7 +479,7 @@ static np_err_t flow_tracker_process(np_processor_t *p, np_packet_t *pkt)
     }
 
     if (!node) {
-        if (ctx->total_flows >= FLOW_MAX_ENTRIES) {
+        if (ctx->total_flows >= max_flows) {
             /* Emergency full sweep */
             time_t now_sec = time(NULL);
             for (int i = 0; i < FLOW_BUCKETS; i++) {
@@ -466,7 +487,7 @@ static np_err_t flow_tracker_process(np_processor_t *p, np_packet_t *pkt)
                 while (*pp) {
                     flow_node_t *n = *pp;
                     double age = difftime(now_sec, n->stats.last_seen.tv_sec);
-                    if (age > (double)FLOW_IDLE_TIMEOUT_S) {
+                    if (age > (double)idle_to) {
                         *pp = n->next;
                         free(n);
                         ctx->total_flows--;
@@ -477,7 +498,7 @@ static np_err_t flow_tracker_process(np_processor_t *p, np_packet_t *pkt)
             }
         }
 
-        if (ctx->total_flows >= FLOW_MAX_ENTRIES) {
+        if (ctx->total_flows >= max_flows) {
             /* Still at cap after sweep — drop the new flow rather than OOM. */
             ctx->flows_dropped++;
             pthread_mutex_unlock(&ctx->lock);
@@ -540,6 +561,12 @@ static const struct np_processor_ops flow_tracker_ops = {
 
 np_processor_t *np_processor_flow_tracker(void)
 {
+    return np_processor_flow_tracker_ex(0, 0);
+}
+
+np_processor_t *np_processor_flow_tracker_ex(uint32_t max_entries,
+                                              uint32_t idle_timeout_s)
+{
     np_processor_t *p = malloc(sizeof(*p));
     if (!p) return NULL;
 
@@ -547,6 +574,20 @@ np_processor_t *np_processor_flow_tracker(void)
     if (!ctx) {
         free(p);
         return NULL;
+    }
+
+    /* FIX (issue: hardcoded FLOW_MAX_ENTRIES / FLOW_IDLE_TIMEOUT_S):
+     * store the caller-supplied values; the accessor functions fall
+     * back to the historical defaults when these are 0. */
+    ctx->max_entries    = max_entries;
+    ctx->idle_timeout_s = idle_timeout_s;
+    if (max_entries != 0) {
+        NP_LOG_INFO("flow_tracker: max entries = %u (default 1,000,000)",
+                    max_entries);
+    }
+    if (idle_timeout_s != 0) {
+        NP_LOG_INFO("flow_tracker: idle timeout = %u s (default 60)",
+                    idle_timeout_s);
     }
 
     pthread_mutex_init(&ctx->lock, NULL);

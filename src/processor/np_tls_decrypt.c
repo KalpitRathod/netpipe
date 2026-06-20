@@ -54,6 +54,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <errno.h>
+#include <limits.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <time.h>
@@ -192,6 +194,27 @@ typedef struct tls_flow {
     bool             c_ccs_seen;   /* client→saw CCS */
     bool             s_ccs_seen;   /* server→saw CCS */
 
+    /* FIX (issue: TLS direction detection falls back to port-magnitude
+     * heuristic on mid-stream capture): flag that we have NOT yet
+     * confirmed the direction via AEAD success.  When true, the
+     * decrypt loop will retry the opposite direction on AEAD failure
+     * and, on success, record the client endpoint so future packets
+     * on this flow skip the heuristic entirely. */
+    bool             direction_ambiguous;
+    /* Once we've confirmed direction via AEAD, lock in the learned
+     * client endpoint so subsequent packets don't need to re-guess. */
+    uint8_t          learned_client_ip[16];
+    uint16_t         learned_client_port;
+    uint8_t          learned_client_ip_ver;  /* 0 = unknown, 4 or 6 */
+
+    /* FIX (issue: No alarm on repeated AEAD failures): counter for
+     * consecutive AEAD failures on this flow.  When it crosses
+     * AEAD_FAILURE_ALERT_THRESHOLD, we emit a WARN-level log so the
+     * operator sees the problem instead of debug-spamming every
+     * failure.  Reset on any successful decryption. */
+    uint32_t         consecutive_aead_failures;
+    bool             aead_alert_emitted;
+
     /* Decryption stats. */
     uint64_t         stat_records_total;
     uint64_t         stat_records_decrypted;
@@ -199,6 +222,8 @@ typedef struct tls_flow {
 
     struct timespec  last_seen;
 } tls_flow_t;
+
+#define AEAD_FAILURE_ALERT_THRESHOLD 10  /* emit WARN after this many */
 
 typedef struct {
     tls_keylog_t  keylog;
@@ -342,20 +367,33 @@ static bool keylog_parse_line(tls_keylog_t *kl, char *line)
     return true;
 }
 
-static void keylog_load(tls_keylog_t *kl, const char *path)
+/* Bug B13 fix: return the number of records loaded (>= 0) or -1 on
+ * failure (file not found / not readable).  The caller can then refuse
+ * to construct an inert processor that silently fails every decryption. */
+static int keylog_load(tls_keylog_t *kl, const char *path)
 {
     FILE *fp = fopen(path, "r");
     if (!fp) {
-        NP_LOG_ERROR("tls_decrypt: cannot open keylog '%s'", path);
-        return;
+        NP_LOG_ERROR("tls_decrypt: cannot open keylog '%s': %s",
+                     path, strerror(errno));
+        return -1;
     }
-    char line[1024];
+    char *line = NULL;
+    size_t line_cap = 0;
     int n = 0;
-    while (fgets(line, sizeof(line), fp)) {
+    /* Bug B14 fix: use getline() instead of fgets() with a fixed 1024-byte
+     * buffer.  fgets() silently splits over-long lines into multiple
+     * fragments, each of which is rejected by the parser — a malformed
+     * keylog with a huge hex blob could thus cause us to miss the
+     * legitimate secret on the next line.  getline() dynamically grows
+     * the buffer so a single line is always read whole. */
+    while (getline(&line, &line_cap, fp) != -1) {
         if (keylog_parse_line(kl, line)) n++;
     }
+    free(line);
     fclose(fp);
     NP_LOG_INFO("tls_decrypt: loaded %d keylog records from %s", n, path);
+    return n;
 }
 
 /* ------------------------------------------------------------------ */
@@ -442,6 +480,20 @@ static bool hkdf_expand_label(const uint8_t *secret, size_t secret_len,
         size_t copy = (out_len - done < t_len) ? (out_len - done) : t_len;
         memcpy(out + done, t, copy);
         done += copy;
+        /* Bug B15 fix: RFC 5869 §2.3 caps HKDF-Expand at 255 blocks
+         * (the counter is a single byte).  If we've already produced
+         * 255 blocks and still need more output, the caller is asking
+         * for more than 255 * hash_size bytes — which is unreachable
+         * for TLS (max 32-byte keys) but the assertion guards future
+         * misuse.  Without this check, `counter` (uint8_t) would wrap
+         * to 0 and produce incorrect output. */
+        if (counter == 255 && done < out_len) {
+            EVP_MD_CTX_free(m);
+            EVP_PKEY_free(pk);
+            NP_LOG_ERROR("tls_decrypt: HKDF-Expand requested %zu bytes "
+                         "exceeds 255-block limit", out_len);
+            return false;
+        }
         counter++;
         EVP_MD_CTX_free(m);
         EVP_PKEY_free(pk);
@@ -645,6 +697,16 @@ static bool tls12_prf(const uint8_t *secret, size_t secret_len,
                        uint8_t *out, size_t out_len,
                        const EVP_MD *md)
 {
+    /* Bug B16 fix: range-check secret_len before any (int) cast.  The
+     * HMAC() calls below cast secret_len to int; if secret_len > INT_MAX
+     * the cast produces a negative value and HMAC() silently fails.
+     * Unreachable for TLS (master secret is 48 bytes) but the assertion
+     * guards future misuse with larger secrets. */
+    if (secret_len > INT_MAX) {
+        NP_LOG_ERROR("tls_decrypt: tls12_prf secret_len %zu > INT_MAX", secret_len);
+        return false;
+    }
+
     /* Build label+seed once (P_hash input). */
     size_t label_len = strlen(label);
     size_t ls_len = label_len + seed_len;
@@ -1218,8 +1280,23 @@ static np_err_t tls_process(np_processor_t *p, np_packet_t *pkt)
         }
         is_client_to_server = src_is_client;
     } else {
-        /* Fallback heuristic. */
+        /* FIX (issue: TLS direction detection falls back to port-magnitude
+         * heuristic on mid-stream capture, which fails for high server
+         * ports like 8443, 8080 — ~half the records fail AEAD auth and
+         * are silently dropped):
+         *
+         * New strategy: try the heuristic first to seed `is_client_to_server`,
+         * but if AEAD authentication fails for the heuristic-chosen direction
+         * AND we have keys for the OTHER direction, retry with the opposite
+         * direction.  Once any record authenticates on a given direction,
+         * record the client endpoint (learned via AEAD success) so
+         * subsequent packets on this flow skip the heuristic entirely.
+         *
+         * This is the cryptographically correct approach: AEAD auth IS
+         * the ground truth.  The port heuristic is just an initial guess.
+         */
         is_client_to_server = (sp > 1024 && dp < 1024) || (sp > dp);
+        f->direction_ambiguous = true;
     }
 
     /* Reusable plaintext buffer for the loop. */
@@ -1399,16 +1476,109 @@ static np_err_t tls_process(np_processor_t *p, np_packet_t *pkt)
             }
         }
 
+        /* FIX (issue: TLS direction detection falls back to port-magnitude
+         * heuristic on mid-stream capture): if direction is ambiguous
+         * and AEAD failed with the heuristic-chosen direction, retry
+         * with the OPPOSITE direction.  AEAD authentication IS ground
+         * truth — if the heuristic was wrong, the opposite key will
+         * authenticate and we lock in the correct direction. */
+        if (!decrypted && f->direction_ambiguous) {
+            bool swapped_dir = !is_client_to_server;
+            tls_aead_key_t *swap_keys[2];
+            uint64_t       *swap_seqs[2];
+            int             swap_n = 0;
+            if (f->version == TLS_VERSION_1_3) {
+                if (swapped_dir) {
+                    if (f->c_hs_key.ready)  { swap_keys[swap_n] = &f->c_hs_key;  swap_seqs[swap_n] = &f->c_hs_seq;  swap_n++; }
+                    if (f->c_app_key.ready) { swap_keys[swap_n] = &f->c_app_key; swap_seqs[swap_n] = &f->c_app_seq; swap_n++; }
+                } else {
+                    if (f->s_hs_key.ready)  { swap_keys[swap_n] = &f->s_hs_key;  swap_seqs[swap_n] = &f->s_hs_seq;  swap_n++; }
+                    if (f->s_app_key.ready) { swap_keys[swap_n] = &f->s_app_key; swap_seqs[swap_n] = &f->s_app_seq; swap_n++; }
+                }
+            } else {
+                if (swapped_dir) {
+                    if (f->c_app_key.ready) { swap_keys[swap_n] = &f->c_app_key; swap_seqs[swap_n] = &f->c_app_seq; swap_n++; }
+                } else {
+                    if (f->s_app_key.ready) { swap_keys[swap_n] = &f->s_app_key; swap_seqs[swap_n] = &f->s_app_seq; swap_n++; }
+                }
+            }
+            for (int i = 0; i < swap_n; i++) {
+                bool ok;
+                if (f->version == TLS_VERSION_1_2) {
+                    ok = aead_decrypt_tls12(swap_keys[i], *swap_seqs[i], ct,
+                                              ctext, rec_len - TLS_HDR_LEN,
+                                              plaintext, &pt_len);
+                } else {
+                    ok = aead_decrypt(swap_keys[i], *swap_seqs[i], ct, ctext,
+                                       rec_len - TLS_HDR_LEN, plaintext, &pt_len);
+                }
+                if (ok) {
+                    (*swap_seqs[i])++;
+                    decrypted = true;
+                    /* The opposite direction authenticated — flip
+                     * is_client_to_server for the rest of this packet
+                     * and record the learned client endpoint so
+                     * future packets skip the heuristic. */
+                    is_client_to_server = swapped_dir;
+                    f->direction_ambiguous = false;
+                    if (pkt->net && pkt->transport) {
+                        if (pkt->net->proto == NP_PROTO_IP4 && pkt->net->len >= 20) {
+                            /* The client is whichever endpoint this
+                             * packet's source ISN'T (since we just
+                             * confirmed the source is the server). */
+                            const uint8_t *client_ip = pkt->net->data + 16; /* dst */
+                            memcpy(f->learned_client_ip, client_ip, 4);
+                            f->learned_client_port = dp;
+                            f->learned_client_ip_ver = 4;
+                            /* Promote to client_endpoint so the gold-
+                             * standard path takes over for future pkts. */
+                            memcpy(f->client_ip, client_ip, 4);
+                            f->client_port = dp;
+                            f->client_ip_ver = 4;
+                            f->have_client_endpoint = true;
+                        } else if (pkt->net->proto == NP_PROTO_IP6 && pkt->net->len >= 40) {
+                            const uint8_t *client_ip6 = pkt->net->data + 24; /* dst */
+                            memcpy(f->learned_client_ip, client_ip6, 16);
+                            f->learned_client_port = dp;
+                            f->learned_client_ip_ver = 6;
+                            memcpy(f->client_ip, client_ip6, 16);
+                            f->client_port = dp;
+                            f->client_ip_ver = 6;
+                            f->have_client_endpoint = true;
+                        }
+                    }
+                    NP_LOG_INFO("tls_decrypt: flow 0x%08x direction resolved "
+                                "via AEAD retry (now c2s=%d)", canon_key,
+                                is_client_to_server);
+                    break;
+                }
+            }
+        }
+
         if (decrypted) {
             f->stat_records_decrypted++;
             ctx->stat_total_decrypted++;
+            /* FIX (issue: No alarm on repeated AEAD failures): reset
+             * the consecutive failure counter on any successful
+             * decryption, so the alert only fires for SUSTAINED
+             * failure streaks rather than one-off bad records. */
+            f->consecutive_aead_failures = 0;
+            f->aead_alert_emitted = false;
 
             /* TLS 1.3 records have a trailing content-type byte (the actual
              * type, e.g. 23 for APPLICATION_DATA, 22 for HANDSHAKE, 21 for ALERT).
-             * Strip it. */
+             * Strip it.
+             *
+             * Bug B17 fix: TLS 1.3 (RFC 8446 §5.4 + RFC 9266) defines
+             * valid inner content types as 20..24 (CCS, Alert, Handshake,
+             * AppData, Heartbeat).  Type 26 (ack, RFC 9146) is also used
+             * by DTLS 1.3 but is not valid for TLS 1.3.  The old code
+             * only accepted 20..23, which left the trailing type byte
+             * in the plaintext for Heartbeat records (type 24),
+             * corrupting downstream parsing by one byte per record. */
             if (f->version == TLS_VERSION_1_3 && pt_len > 0) {
                 uint8_t inner_type = plaintext[pt_len - 1];
-                if (inner_type >= 20 && inner_type <= 23) {
+                if (inner_type >= 20 && inner_type <= 24) {
                     pt_len--;
                 }
             }
@@ -1418,19 +1588,67 @@ static np_err_t tls_process(np_processor_t *p, np_packet_t *pkt)
              * are handshake-internal and downstream consumers (HTTP
              * parsers, etc.) don't want them in stream_data. */
             if (ct == TLS_CT_APPLICATION) {
+                /* Bug B19 fix: check for size_t overflow before the
+                 * realloc call.  pt_len is bounded by TLS_MAX_RECORD
+                 * (16384 + overhead) per record, so reaching SIZE_MAX
+                 * is impractical, but the pattern is unsafe in general
+                 * and triggers UBSan with -fsanitize=undefined. */
+                if (accumulated_len > SIZE_MAX - pt_len) {
+                    NP_LOG_ERROR("tls_decrypt: accumulated stream length "
+                                 "would overflow size_t — dropping record");
+                    free(plaintext);
+                    break;
+                }
                 uint8_t *na = realloc(accumulated, accumulated_len + pt_len);
                 if (na) {
                     memcpy(na + accumulated_len, plaintext, pt_len);
                     accumulated = na;
                     accumulated_len += pt_len;
+                } else {
+                    NP_LOG_WARN("tls_decrypt: realloc of accumulated "
+                                "buffer (%zu bytes) failed",
+                                accumulated_len + pt_len);
                 }
             }
         } else {
             f->stat_records_failed++;
+            /* FIX (issue: No alarm on repeated AEAD failures): count
+             * consecutive failures and emit a WARN-level alert when
+             * the streak crosses AEAD_FAILURE_ALERT_THRESHOLD.  This
+             * catches attacker-crafted ServerHellos with valid
+             * sid_len=32 but a wrong cipher suite (which silently
+             * misaligns and would otherwise just spam DEBUG), as well
+             * as genuinely broken captures (wrong keylog, key rollover,
+             * partial capture).  The alert is rate-limited: only one
+             * WARN per flow per failure-streak, then we go quiet until
+             * either a success resets the streak or the streak crosses
+             * the next power-of-two threshold. */
+            f->consecutive_aead_failures++;
+            if (f->consecutive_aead_failures == AEAD_FAILURE_ALERT_THRESHOLD) {
+                NP_LOG_WARN("tls_decrypt: flow 0x%08x has had %u consecutive "
+                            "AEAD authentication failures — likely causes: "
+                            "wrong/stale keylog, key rollover, mid-stream "
+                            "capture with no ClientHello, or attacker-crafted "
+                            "ServerHello with wrong cipher suite 0x%04x "
+                            "(version=%u).  Suppressing further alerts until "
+                            "the streak resets.",
+                            canon_key, f->consecutive_aead_failures,
+                            f->cipher_suite, f->version);
+                f->aead_alert_emitted = true;
+            } else if (f->aead_alert_emitted &&
+                       (f->consecutive_aead_failures %
+                            (AEAD_FAILURE_ALERT_THRESHOLD * 10)) == 0) {
+                /* Re-emit at 100, 1000, 10000... so very-long streaks
+                 * aren't completely silent. */
+                NP_LOG_WARN("tls_decrypt: flow 0x%08x still failing AEAD "
+                            "(streak now %u records)",
+                            canon_key, f->consecutive_aead_failures);
+            }
             NP_LOG_DEBUG("tls_decrypt: AEAD auth failed for flow 0x%08x "
-                         "(tried %d keys, direction=%s, rec_offset=%zu)",
+                         "(tried %d keys, direction=%s, rec_offset=%zu, streak=%u)",
                          canon_key, n_keys,
-                         is_client_to_server ? "c2s" : "s2c", offset);
+                         is_client_to_server ? "c2s" : "s2c", offset,
+                         f->consecutive_aead_failures);
         }
 
         offset += this_rec_total;
@@ -1459,8 +1677,23 @@ static np_err_t tls_process(np_processor_t *p, np_packet_t *pkt)
         /* Also update the underlying mutable layer. */
         for (int i = 0; i < pkt->nlayers; i++) {
             if (&pkt->layers[i] == pkt->app) {
+                /* FIX (issue: TLS-decrypt mutates pkt->layers[i].data
+                 * in place to point at decrypted plaintext — subtle
+                 * aliasing invariant): set reserved[1]=1 as a non-NULL
+                 * sentinel and reserved[2]=original offset within
+                 * pkt->raw, so downstream code can detect the aliasing
+                 * via np_packet_app_layer_is_decrypted() and recover
+                 * the original encrypted bytes via
+                 * np_packet_original_app_layer(). */
+                size_t orig_off = (pkt->layers[i].data && pkt->raw &&
+                                   pkt->layers[i].data >= pkt->raw &&
+                                   pkt->layers[i].data < pkt->raw + pkt->caplen)
+                                  ? (size_t)(pkt->layers[i].data - pkt->raw)
+                                  : 0;
                 pkt->layers[i].data = accumulated;
                 pkt->layers[i].len  = accumulated_len;
+                pkt->reserved[1] = (void *)1;       /* aliasing flag   */
+                pkt->reserved[2] = (void *)orig_off; /* original offset */
                 break;
             }
         }
@@ -1503,7 +1736,29 @@ np_processor_t *np_processor_tls_decrypt(const char *keylog_path)
         return NULL;
     }
     if (keylog_path) {
-        keylog_load(&ctx->keylog, keylog_path);
+        /* Bug B13 fix: if keylog_load fails (returns -1) or loads zero
+         * records, refuse to construct the processor rather than
+         * returning an inert one that silently fails every decryption.
+         * The caller (main.c) already logs the failure path. */
+        int n = keylog_load(&ctx->keylog, keylog_path);
+        if (n <= 0) {
+            NP_LOG_ERROR("tls_decrypt: keylog '%s' not usable "
+                         "(%s) — refusing to create processor",
+                         keylog_path, n < 0 ? "open failed" : "no records");
+            pthread_mutex_destroy(&ctx->lock);
+            free(ctx);
+            free(p);
+            return NULL;
+        }
+    } else {
+        /* No keylog path provided — this is also useless for decryption.
+         * Refuse rather than create a no-op processor. */
+        NP_LOG_ERROR("tls_decrypt: no keylog path provided — refusing "
+                     "to create processor");
+        pthread_mutex_destroy(&ctx->lock);
+        free(ctx);
+        free(p);
+        return NULL;
     }
     p->ops  = &tls_ops;
     p->priv = ctx;

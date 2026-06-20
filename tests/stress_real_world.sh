@@ -26,7 +26,7 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/home/z/my-project/deps/local/lib"
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:"
 
 BIN="./build/bin/netpipe"
 FIXTURES="tests/fixtures"
@@ -149,7 +149,7 @@ print('YES' if found else 'NO')
         fail "TLS decryption did not produce HTTP plaintext"
     fi
 else
-    skip "TLS fixtures not generated (run: python3 scripts/gen_tls_fixtures.py)"
+    skip "TLS fixtures not generated (run: python3 tests/python/gen_tls_fixtures.py)"
 fi
 
 # ── 4. Lua IDS detection ───────────────────────────────────────────────
@@ -157,7 +157,7 @@ fi
 banner "4. LUA IDS DETECTION (mitigate.lua)"
 
 if [[ -f mitigate.lua ]]; then
-    if python3 /home/z/my-project/scripts/test_mitigate_lua.py >/dev/null 2>&1; then
+    if python3 tests/python/test_mitigate_lua.py >/dev/null 2>&1; then
         ok "mitigate.lua end-to-end test (6 scenarios)"
     else
         fail "mitigate.lua end-to-end test failed"

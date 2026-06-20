@@ -20,10 +20,6 @@ cd "$REPO_ROOT"
 
 # Auto-detect a local deps prefix (for environments where libpcap is not
 # installed system-wide, e.g. CI containers without root).
-if [[ -d /home/z/my-project/deps/local/include ]]; then
-    export LOCAL_PREFIX=/home/z/my-project/deps/local
-    export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:${LOCAL_PREFIX}/lib"
-fi
 
 BIN="./build/bin/netpipe"
 FIXTURES="tests/fixtures"
@@ -87,7 +83,12 @@ if echo "$UNIT_OUT" | grep -q "All tests passed"; then
     ok "test_bufpool — buffer pool / ref-counting"
 else
     fail "unit test suite had failures  (run: make test)"
-    [[ "$VERBOSE" == "--verbose" ]] && echo "$UNIT_OUT"
+    # FIX: always show the last 30 lines of make test output on failure
+    # so the user can see which specific test crashed (previously only
+    # shown with --verbose).
+    echo "      ┌─ make test output (last 30 lines) ─────────────"
+    echo "$UNIT_OUT" | tail -30 | sed 's/^/      │ /'
+    echo "      └────────────────────────────────────────────────"
 fi
 
 # ── 2. Version ───────────────────────────────────────────────────────────────
@@ -207,7 +208,12 @@ fi
 # We expect 5 such lines (all.pcap has 5 packets) plus the closing
 # "[LUA] total=5" summary.
 LUA_OUT=$(capture $BIN -r "$FIXTURES/all.pcap" -proc lua:test.lua)
-LUA_PKT_CNT=$(echo "$LUA_OUT" | grep -c "^\[LUA\] #" || echo 0)
+# FIX: grep -c with || echo 0 can output "0\n0" (two lines), which breaks
+# the [[ ]] arithmetic.  Use a single-line approach that suppresses grep's
+# exit code properly.
+LUA_PKT_CNT=$(echo "$LUA_OUT" | grep -c "^\[LUA\] #" 2>/dev/null || true)
+LUA_PKT_CNT=${LUA_PKT_CNT//[^0-9]/}  # strip any non-numeric chars
+LUA_PKT_CNT=${LUA_PKT_CNT:-0}
 if [[ "$LUA_PKT_CNT" -eq 5 ]] && \
    echo "$LUA_OUT" | grep -q "LUA] total=5"; then
     ok "-proc lua:test.lua       — 5×process + summary fired"
@@ -285,7 +291,18 @@ if ip tuntap list 2>/dev/null | grep -q "^tap0:"; then
         fail "tap://tap0  — $(echo "$TAP_OUT" | tail -1)"
     fi
 else
-    skip "tap://tap0  — tap0 not found (needs: sudo ip tuntap add dev tap0 mode tap)"
+    # FIX: auto-create tap0 instead of skipping
+    if ip tuntap add dev tap0 mode tap 2>/dev/null; then
+        TAP_OUT=$(capture $BIN -r "$FIXTURES/all.pcap" -o tap://tap0)
+        if echo "$TAP_OUT" | grep -q "opened TAP device: tap0"; then
+            ok "tap://tap0  — device auto-created and opened"
+        else
+            fail "tap://tap0  — $(echo "$TAP_OUT" | tail -1)"
+        fi
+        ip tuntap del dev tap0 mode tap 2>/dev/null || true
+    else
+        skip "tap://tap0  — could not auto-create (needs: sudo ip tuntap add dev tap0 mode tap)"
+    fi
 fi
 
 # ── 8. Valgrind ──────────────────────────────────────────────────────────────
@@ -297,11 +314,24 @@ if require_bin valgrind; then
         --error-exitcode=1 \
         $BIN -r "$FIXTURES/all.pcap" \
         -proc tcp-stream -proc flow-tracker -fmt null 2>&1 || true)
-    if echo "$VG_OUT" | grep -q "ERROR SUMMARY: 0 errors" && \
-       echo "$VG_OUT" | grep -q "in use at exit: 0 bytes"; then
-        ok "valgrind  — 0 errors, 0 leaks  (tcp-stream + flow-tracker + all.pcap)"
+    # FIX: the check previously required "in use at exit: 0 bytes" which is
+    # too strict — libc's stdio buffers and pthread's thread-local storage
+    # are "still reachable" at exit and show up as non-zero "in use" even
+    # in a perfectly clean program.  Now we only fail on:
+    #   1. Any valgrind errors (ERROR SUMMARY: N errors, N > 0)
+    #   2. Any "definitely lost" bytes (the real leak signal)
+    #   3. Any "indirectly lost" bytes
+    # "still reachable" and "possibly lost" are informational only.
+    VG_ERRORS=$(echo "$VG_OUT" | grep -oP 'ERROR SUMMARY: \K[0-9]+' | head -1)
+    VG_DEF_LOST=$(echo "$VG_OUT" | grep -oP 'definitely lost: \K[0-9]+' | head -1)
+    VG_IND_LOST=$(echo "$VG_OUT" | grep -oP 'indirectly lost: \K[0-9]+' | head -1)
+    VG_ERRORS=${VG_ERRORS:-0}
+    VG_DEF_LOST=${VG_DEF_LOST:-0}
+    VG_IND_LOST=${VG_IND_LOST:-0}
+    if [[ "$VG_ERRORS" -eq 0 && "$VG_DEF_LOST" -eq 0 && "$VG_IND_LOST" -eq 0 ]]; then
+        ok "valgrind  — 0 errors, 0 definitely-lost bytes  (tcp-stream + flow-tracker + all.pcap)"
     else
-        fail "valgrind  — errors or leaks detected"
+        fail "valgrind  — errors=$VG_ERRORS, definitely_lost=$VG_DEF_LOST bytes, indirectly_lost=$VG_IND_LOST bytes"
         [[ "$VERBOSE" == "--verbose" ]] && echo "$VG_OUT"
     fi
 else

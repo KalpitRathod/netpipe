@@ -206,3 +206,44 @@ void np_source_free(np_source_t *src)
 {
     if (src && src->ops && src->ops->free) src->ops->free(src);
 }
+
+/* FIX (issue: BPF filters were run in user-space via bpf_filter()
+ * instead of being compiled into the kernel via pcap_setfilter()):
+ * install the BPF program on the libpcap handle so the kernel drops
+ * non-matching packets before they cross the kernel/user boundary.
+ * This is a major throughput win on high-traffic interfaces (e.g. a
+ * 10 Gbps mirror with "tcp port 443" typically drops 99%+ of frames
+ * in the kernel).
+ *
+ * The user-space np_filter_bpf() filter is still applied as well —
+ * this function is purely a kernel-side optimization.  The two paths
+ * produce identical filtering semantics. */
+np_err_t np_source_set_kernel_bpf(np_source_t *src, const char *expr)
+{
+    if (!src || !expr) return NP_ERR_GENERIC;
+    /* Only libpcap-backed sources support this. */
+    if (!src->ops || src->ops->next != common_next) {
+        NP_LOG_WARN("np_source_set_kernel_bpf: source '%s' does not "
+                    "support kernel-side BPF (ignored)", src->name);
+        return NP_ERR_PROTO;
+    }
+    pcap_priv_t *p = src->priv;
+    if (!p || !p->handle) return NP_ERR_GENERIC;
+
+    struct bpf_program prog;
+    /* pcap_compile on a live handle uses the handle's link-layer type
+     * and snapshot length automatically — no need for pcap_open_dead. */
+    if (pcap_compile(p->handle, &prog, expr, 1, PCAP_NETMASK_UNKNOWN) != 0) {
+        NP_LOG_ERROR("pcap_compile(\"%s\"): %s", expr, pcap_geterr(p->handle));
+        return NP_ERR_FILTER;
+    }
+    if (pcap_setfilter(p->handle, &prog) != 0) {
+        NP_LOG_ERROR("pcap_setfilter(\"%s\"): %s", expr, pcap_geterr(p->handle));
+        pcap_freecode(&prog);
+        return NP_ERR_GENERIC;
+    }
+    pcap_freecode(&prog);
+    NP_LOG_INFO("installed kernel-side BPF filter on source '%s': %s",
+                src->name, expr);
+    return NP_OK;
+}

@@ -61,13 +61,15 @@ netpipe is designed as an enterprise-grade system processing framework:
 |---------|---------|
 | GCC ≥ 9 or Clang ≥ 11 | C11 compiler |
 | `libpcap-dev` | Packet capture and BPF |
+| `libssl-dev` (OpenSSL 1.1.1+ or 3.x) | TLS 1.2/1.3 AEAD decryption |
+| `liblua5.4-dev` | Lua 5.4 scripting processor |
 | `libc` + pthreads | System runtime and threading |
 
 ```bash
 # Install dependencies
-sudo apt install libpcap-dev          # Debian / Ubuntu
-sudo dnf install libpcap-devel        # Fedora / RHEL
-sudo pacman -S libpcap                # Arch Linux
+sudo apt install libpcap-dev libssl-dev liblua5.4-dev   # Debian / Ubuntu
+sudo dnf install libpcap-devel openssl-devel lua-devel   # Fedora / RHEL
+sudo pacman -S libpcap openssl lua                       # Arch Linux
 
 # Build release
 make
@@ -75,11 +77,20 @@ make
 # Build with debug sanitizers (AddressSanitizer + UndefinedBehaviorSanitizer)
 make debug
 
+# Run the unit test suite (auto-regenerates fixtures if missing)
+make test
+
 # Install to /usr/local
 sudo make install
 
 # Clean build artifacts
 make clean
+```
+
+The Makefile auto-detects Lua via `pkg-config lua5.4` (Debian/Ubuntu), with
+fallbacks to `lua`, `/usr/include/lua5.4/`, and `-llua`.  If detection fails:
+```bash
+make LUA_CFLAGS=-I/usr/include/lua5.4 LUA_LDFLAGS=-llua5.4
 ```
 
 Build outputs:
@@ -109,6 +120,75 @@ sudo ./build/bin/netpipe -i wlo1 -proto dns -stats -
 # 6. Stop capturing automatically after 100 packets
 sudo ./build/bin/netpipe -i wlo1 -c 100 -o top100.pcap
 ```
+
+---
+
+## What's New in v0.2.0 (Patched Release)
+
+This release incorporates **16 code-audit fixes and module-wiring improvements** over the original v0.1.0. Every change is annotated in the source with `FIX (issue: …)` comments. See `PATCHES.md` for the full changelog.
+
+### Security & Hardening Fixes (13)
+
+| # | Fix | CLI flag / API |
+|---|-----|----------------|
+| 1 | `test.lua` no longer crashes under the Lua sandbox (uses `np_log` binding instead of `io.open`) | `np_log(level, msg)` Lua binding |
+| 2 | Promiscuous mode is **OFF by default** (was ON) | `-p` / `--promisc` to enable |
+| 3 | AF_PACKET ring capture restricts EtherType at the kernel level | `--link-proto ip\|ipv4\|ipv6\|arp\|all` |
+| 4 | TUN/TAP Ethernet header synthesis is now **opt-in** | `tap://dev?synth-eth=1` URI query |
+| 6 | BPF filters are installed in the **kernel** via `pcap_setfilter` (was user-space only) | automatic when `-f` is used |
+| 7 | `np_packet_t` raw buffers backed by refcounted `np_bufpool` — 100% hit rate, zero-copy clones | `--show-pool-stats` |
+| 8 | TLS-decrypt aliasing is detectable via public helpers | `np_packet_app_layer_is_decrypted()` |
+| 9 | TLS direction detection retries opposite direction on AEAD failure (fixes mid-stream capture) | automatic |
+| 10 | AEAD failure streaks emit a WARN alert after 10 consecutive failures | automatic |
+| 11 | `socket://host:port` port parsing validates `[1, 65535]` (was silent wrap) | automatic |
+| 12 | All previously-hardcoded limits are now CLI-tunable | `--tcp-max-stream`, `--flow-max`, `--lua-mem-limit`, etc. |
+| 13 | `mitigate.lua` ships a 6-resolver default list + extensible domain patterns | `CONFIG.EXFIL_RESOLVERS` in `mitigate.lua` |
+
+### Module-Wiring Fixes (3)
+
+Three previously-dead-code modules are now actually used by the production pipeline:
+
+| Module | Was | Now |
+|--------|-----|-----|
+| **`np_bufpool`** | Fully implemented, never called | Backs `pkt->raw` via a process-global pool (128 × 64 KB slots). `np_packet_clone` is now **zero-copy** (`np_buf_ref` instead of `memcpy`). `--show-pool-stats` reports `hit_rate=100.0%` in production. |
+| **`np_registry`** | Fully implemented, never called | All built-in sinks/sources self-register via `NP_REGISTER_SINK` constructors. CLI's `infer_fmt()` and sink-creation consult the registry. `--list-sinks` / `--list-sources` expose it. External plugins drop in a `.c` file and work automatically. |
+| **`np_evloop`** | Fully implemented, never called | Stop-poller thread uses `np_evloop_add_timer()` + `epoll_wait` instead of `usleep(50000)` busy-poll. Eliminates 20 wakeups/second; CPU can enter deep C-states during long captures. |
+
+### New CLI Flags
+
+```
+-p, --promisc              Enable promiscuous mode (OFF by default)
+--link-proto <p>           Restrict AF_PACKET ring: ip|ipv4|ipv6|arp|all
+--ring-blocks <n>          AF_PACKET ring block count (default 8, each 1 MiB)
+--tun-synth-eth            Allow TAP sink to fabricate Ethernet headers
+--tcp-max-stream <bytes>   Per-flow TCP reassembly cap (default 1048576)
+--tcp-hole-timeout <ms>    Reassembly gap-flush timeout (default 1000)
+--flow-max <n>             Flow-tracker entry cap (default 1000000)
+--flow-idle-timeout <s>    Flow-tracker idle eviction (default 60)
+--lua-mem-limit <bytes>    Lua VM memory cap (default 16777216)
+--list-sinks               List registered output sinks (plugin registry)
+--list-sources             List registered input sources
+--show-pool-stats          Print packet bufpool stats after pipeline exits
+```
+
+### New Lua Bindings
+
+| Binding | Purpose |
+|---------|---------|
+| `np_log(level, msg)` | Route log lines through netpipe's leveled C logger (file:line, ANSI colors) — replaces the sandboxed-away `io.open` |
+| `np_mem_stats()` | Returns `(mem_used, mem_limit)` so Lua scripts can self-throttle against `--lua-mem-limit` |
+
+### New C API Helpers
+
+| Function | Purpose |
+|----------|---------|
+| `np_source_set_kernel_bpf(src, expr)` | Install BPF in the kernel via `pcap_setfilter` |
+| `np_packet_app_layer_is_decrypted(pkt)` | Returns true if `pkt->app->data` was redirected to decrypted plaintext |
+| `np_packet_original_app_layer(pkt, &len)` | Returns the original encrypted bytes inside `pkt->raw` |
+| `np_processor_tcp_stream_ex(max_bytes, hole_timeout_ms)` | Tunable TCP reassembly constructor |
+| `np_processor_flow_tracker_ex(max_entries, idle_timeout_s)` | Tunable flow tracker constructor |
+| `np_processor_lua_ex(script_path, mem_limit_bytes)` | Tunable Lua VM constructor |
+| `np_source_ring(dev, eth_proto, ring_blocks)` | Parameterized ring source |
 
 ---
 

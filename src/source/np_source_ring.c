@@ -188,8 +188,18 @@ static const struct np_source_ops ring_ops = {
     .free  = ring_src_free,
 };
 
-np_source_t *np_source_ring(const char *device)
+np_source_t *np_source_ring(const char *device,
+                             uint16_t eth_proto,
+                             int      ring_blocks)
 {
+    /* FIX (issue: ETH_P_ALL by default + hardcoded ring size):
+     * Accept a caller-specified EtherType (in HOST byte order) and a
+     * caller-specified ring block count.  Defaults preserve the
+     * historical behaviour (ETH_P_ALL + 8 blocks) so existing callers
+     * using the wrapper still get the same capture profile. */
+    if (eth_proto == 0)    eth_proto    = ETH_P_ALL;
+    if (ring_blocks <= 0)  ring_blocks  = 8;
+
     int fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if (fd < 0) {
         NP_LOG_ERROR("socket(AF_PACKET): %s (are you root?)", strerror(errno));
@@ -212,7 +222,9 @@ np_source_t *np_source_ring(const char *device)
     memset(&sll, 0, sizeof(sll));
     sll.sll_family = AF_PACKET;
     sll.sll_ifindex = ifindex;
-    sll.sll_protocol = (uint16_t)htons(ETH_P_ALL);
+    /* FIX: use the caller-specified EtherType for the bind, so the
+     * kernel only queues frames of that protocol onto the ring. */
+    sll.sll_protocol = (uint16_t)htons(eth_proto);
     if (bind(fd, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
         NP_LOG_ERROR("bind AF_PACKET to index %d failed: %s", ifindex, strerror(errno));
         close(fd);
@@ -232,7 +244,7 @@ np_source_t *np_source_ring(const char *device)
     memset(&req, 0, sizeof(req));
     req.tp_block_size = 4096 * 256; // 1 MB block size
     req.tp_frame_size = 2048;       // 2 KB frame size
-    req.tp_block_nr   = 8;          // 8 blocks => 8 MB ring size
+    req.tp_block_nr   = (unsigned)ring_blocks;  /* FIX: caller-specified */
     req.tp_frame_nr   = (req.tp_block_size * req.tp_block_nr) / req.tp_frame_size;
 
     if (setsockopt(fd, SOL_PACKET, PACKET_RX_RING, &req, sizeof(req)) < 0) {
@@ -296,9 +308,11 @@ np_source_t *np_source_ring(const char *device)
 #include "netpipe.h"
 #include "../log/np_log.h"
 
-np_source_t *np_source_ring(const char *device)
+np_source_t *np_source_ring(const char *device,
+                             uint16_t eth_proto,
+                             int      ring_blocks)
 {
-    (void)device;
+    (void)device; (void)eth_proto; (void)ring_blocks;
     NP_LOG_ERROR("np_source_ring: AF_PACKET zero-copy ring capture is only "
                  "available on Linux.  Use -i <device> (libpcap) instead.");
     return NULL;

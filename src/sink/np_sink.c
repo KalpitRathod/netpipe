@@ -118,6 +118,9 @@ static const struct np_sink_ops pcap_sink_ops = {
 
 np_sink_t *np_sink_pcap(const char *path)
 {
+    /* Bug B25 fix: validate path is non-NULL before snprintf("%s", path)
+     * — passing NULL to %s is UB. */
+    if (!path) { NP_LOG_ERROR("np_sink_pcap: path is NULL"); return NULL; }
     pcap_sink_priv_t *p = calloc(1, sizeof(*p));
     if (!p) return NULL;
     snprintf(p->path, sizeof(p->path), "%s", path);
@@ -290,6 +293,8 @@ static const struct np_sink_ops json_sink_ops = {
 
 np_sink_t *np_sink_json(const char *path)
 {
+    /* Bug B25 fix: validate path is non-NULL. */
+    if (!path) { NP_LOG_ERROR("np_sink_json: path is NULL"); return NULL; }
     json_sink_priv_t *p = calloc(1, sizeof(*p));
     if (!p) return NULL;
     snprintf(p->path, sizeof(p->path), "%s", path);
@@ -749,6 +754,15 @@ typedef struct {
     int fd;
     char dev[IFNAMSIZ];
     bool is_tun;
+    /* FIX (issue: TUN/TAP fabricates Ethernet headers by default):
+     * The previous code unconditionally synthesised a 14-byte Ethernet
+     * header (dst=02:00:00:00:00:01, src=02:00:00:00:00:02, ethertype
+     * 0x0800/0x86DD) when replaying SLL-captured or raw-IP pcaps into a
+     * TAP interface.  That's packet forgery into the kernel network
+     * stack — benign in the replay context but a general mechanism
+     * that should be opt-in.  When `synth_eth` is false (the new
+     * default), such packets are dropped with a debug log instead. */
+    bool synth_eth;
 } tuntap_sink_priv_t;
 
 static np_err_t tuntap_sink_open(np_sink_t *s, np_linktype_t lt)
@@ -791,7 +805,11 @@ static np_err_t tuntap_sink_open(np_sink_t *s, np_linktype_t lt)
         return NP_ERR_GENERIC;
     }
     
-    strcpy(p->dev, ifr.ifr_name);
+    /* Bug B24 fix: use snprintf instead of strcpy for the dev name
+     * copy.  ifr.ifr_name is IFNAMSIZ (16) bytes and p->dev is also
+     * IFNAMSIZ, so the copy was always safe in practice, but snprintf
+     * is more defensive against future changes to either struct. */
+    snprintf(p->dev, sizeof(p->dev), "%s", ifr.ifr_name);
     NP_LOG_INFO("tuntap: opened %s device: %s", p->is_tun ? "TUN" : "TAP", p->dev);
     
     return NP_OK;
@@ -863,6 +881,22 @@ static np_err_t tuntap_sink_write(np_sink_t *s, const np_packet_t *pkt)
 
     if (buf && buflen > 0) {
         if (!p->is_tun && !pkt->eth) {
+            /* FIX (issue: TUN/TAP fabricates Ethernet headers by default):
+             * Only synthesize a 14-byte Ethernet header when the caller
+             * has explicitly opted in via the URI query string
+             * (?synth-eth=1) or the np_sink_tuntap_ex() constructor.
+             * Otherwise drop the packet with a debug log so the operator
+             * sees why their replay is silently losing non-Ethernet
+             * frames.  This is a security/audit-conscious default — the
+             * synthesis is packet forgery into the kernel L2 stack and
+             * should not happen without explicit user consent. */
+            if (!p->synth_eth) {
+                NP_LOG_DEBUG("tuntap: dropping non-Ethernet packet (seq=%lu) "
+                             "on TAP sink — pass ?synth-eth=1 in the URI to "
+                             "synthesise an Ethernet header",
+                             (unsigned long)pkt->seq);
+                return NP_OK;
+            }
             /* Missing Ethernet header on a Layer 2 TAP interface.
              * This happens when replaying SLL-captured PCAPs (like from wlo1).
              * We must synthesize a 14-byte Ethernet header.
@@ -941,9 +975,12 @@ static const struct np_sink_ops tuntap_sink_ops = {
 
 np_sink_t *np_sink_tuntap(const char *uri)
 {
+    /* Bug B25 fix: validate uri is non-NULL before strncmp. */
+    if (!uri) { NP_LOG_ERROR("np_sink_tuntap: uri is NULL"); return NULL; }
     bool is_tun = false;
     char dev_name[16] = {0};
-    
+    bool synth_eth = false;
+
     if (strncmp(uri, "tun://", 6) == 0) {
         is_tun = true;
         strncpy(dev_name, uri + 6, sizeof(dev_name) - 1);
@@ -954,19 +991,38 @@ np_sink_t *np_sink_tuntap(const char *uri)
         return NULL;
     }
 
+    /* FIX (issue: TUN/TAP fabricates Ethernet headers by default):
+     * Parse an optional ?synth-eth=1 query string from the device name
+     * slot.  This lets the operator opt in to Ethernet header
+     * synthesis for non-Ethernet captures when replaying into a TAP
+     * interface.  Examples:
+     *   tap://tap0                 # default: drop non-Ethernet frames
+     *   tap://tap0?synth-eth=1     # opt in: synthesize Ethernet headers
+     *   tun://tun0                 # TUN ignores synth-eth (L3 only)
+     */
+    char *q = strchr(dev_name, '?');
+    if (q) {
+        *q = '\0';  /* terminate dev_name at the '?' */
+        if (strstr(q + 1, "synth-eth=1")) {
+            synth_eth = true;
+        }
+    }
+
     tuntap_sink_priv_t *p = calloc(1, sizeof(*p));
     if (!p) return NULL;
-    
+
     p->fd = -1;
     p->is_tun = is_tun;
+    p->synth_eth = synth_eth;
     strcpy(p->dev, dev_name);
-    
+
     np_sink_t *s = calloc(1, sizeof(*s));
     if (!s) { free(p); return NULL; }
-    
+
     s->ops  = &tuntap_sink_ops;
     s->priv = p;
-    snprintf(s->name, sizeof(s->name), "tuntap:%s", p->dev);
+    snprintf(s->name, sizeof(s->name), "tuntap:%s%s", p->dev,
+             synth_eth ? "?synth-eth=1" : "");
     return s;
 }
 #else
@@ -1261,6 +1317,8 @@ static const struct np_sink_ops socket_sink_ops = {
 
 np_sink_t *np_sink_socket(const char *uri, const char *fmt)
 {
+    /* Bug B25 fix: validate uri is non-NULL before strncmp. */
+    if (!uri) { NP_LOG_ERROR("np_sink_socket: uri is NULL"); return NULL; }
     if (strncmp(uri, "socket://", 9) != 0) return NULL;
 
     char host_port[256];
@@ -1274,12 +1332,27 @@ np_sink_t *np_sink_socket(const char *uri, const char *fmt)
     }
     *colon = '\0';
 
+    /* FIX (issue: socket_sink_write parses port with atoi() — no range
+     * check): replace atoi with strtoul + explicit [1, 65535] range
+     * validation.  atoi silently wraps out-of-range values (e.g.
+     * socket://host:99999 → port 34463), which is a foot-gun. */
+    errno = 0;
+    char *endp = NULL;
+    unsigned long port_ul = strtoul(colon + 1, &endp, 10);
+    if (errno != 0 || !endp || *endp != '\0' ||
+        port_ul < 1 || port_ul > 65535) {
+        NP_LOG_ERROR("socket: invalid port '%s' in uri '%s' "
+                     "(must be integer in [1, 65535])",
+                     colon + 1, uri);
+        return NULL;
+    }
+
     socket_sink_priv_t *p = calloc(1, sizeof(*p));
     if (!p) return NULL;
 
     p->fd = -1;
     snprintf(p->host, sizeof(p->host), "%s", host_port);
-    p->port = atoi(colon + 1);
+    p->port = (int)port_ul;
 
     if (fmt && !strcmp(fmt, "json"))      p->fmt = NP_SOCK_FMT_JSON;
     else if (fmt && !strcmp(fmt, "hex"))  p->fmt = NP_SOCK_FMT_HEX;
@@ -1447,6 +1520,8 @@ static const struct np_sink_ops pcapng_sink_ops = {
 
 np_sink_t *np_sink_pcapng(const char *path)
 {
+    /* Bug B25 fix: validate path is non-NULL. */
+    if (!path) { NP_LOG_ERROR("np_sink_pcapng: path is NULL"); return NULL; }
     pcapng_sink_priv_t *p = calloc(1, sizeof(*p));
     if (!p) return NULL;
     snprintf(p->path, sizeof(p->path), "%s", path);

@@ -15,10 +15,59 @@
 -- (np_lua.c returns NP_ERR_FILTER which the pipeline interprets as
 -- "do not forward to sinks").  Returning `true` keeps the packet.
 
-local THRESHOLD_LONG_NAME  = 50   -- chars
-local EXFIL_PATTERN        = "exfil[%-_]payload"
-local TUNNEL_LABEL_LEN     = 30                  -- suspicious long base32 label
-local EXFIL_RESOLVER       = "8.8.8.8"          -- threshold dst for alert
+-- FIX (issue: mitigate.lua hardcodes EXFIL_RESOLVER = "8.8.8.8" — a
+-- demo, not production-ready IPS):
+--
+-- All thresholds and the resolver list are now configurable via:
+--   (1) Environment variables (read at init time via the os.getenv
+--       binding — but the sandbox nils out `os`, so we instead use
+--       the new np_log Lua binding and accept resolver lists from
+--       globals set by the C caller via a wrapper script).
+--   (2) A Lua module-level configuration table at the top of this
+--       file — operators can edit the file directly or override
+--       individual fields from a wrapper script that does
+--       `dofile` is not available, so instead operators can edit
+--       the values in place.
+--
+-- For full env-var support, see the C-side wrapper that netpipe can
+-- expose via np_log() — but since `os.getenv` is sandboxed away, the
+-- pragmatic fix is to make the resolver list a comma-separated Lua
+-- table that the operator edits in-file.
+
+local CONFIG = {
+    THRESHOLD_LONG_NAME = 50,
+    EXFIL_PATTERN       = "exfil[%-_]payload",
+    TUNNEL_LABEL_LEN    = 30,
+    -- FIX: list of resolver IPs considered "exfil destinations".
+    -- The default list includes the public DNS resolvers most commonly
+    -- abused for DNS exfiltration.  Operators should add their own
+    -- known-bad resolvers or remove entries that are legitimate in
+    -- their environment.
+    EXFIL_RESOLVERS = {
+        "8.8.8.8",        -- Google Public DNS
+        "8.8.4.4",        -- Google Public DNS (secondary)
+        "1.1.1.1",        -- Cloudflare DNS
+        "1.0.0.1",        -- Cloudflare DNS (secondary)
+        "9.9.9.9",        -- Quad9
+        "208.67.222.222", -- Cisco OpenDNS
+    },
+    -- FIX: optional list of additional domains/keywords to flag as
+    -- exfil destinations (matched against dns_query_name).  Empty by
+    -- default; operators add e.g. { "%.exfil%.example%.com$" }.
+    EXFIL_DOMAIN_PATTERNS = {},
+}
+
+-- Local aliases for backwards compatibility with the old single-resolver
+-- rule.  Operators who only want to flag 8.8.8.8 can shrink the list.
+local THRESHOLD_LONG_NAME  = CONFIG.THRESHOLD_LONG_NAME
+local EXFIL_PATTERN        = CONFIG.EXFIL_PATTERN
+local TUNNEL_LABEL_LEN     = CONFIG.TUNNEL_LABEL_LEN
+
+-- Build a set for O(1) resolver lookup.
+local EXFIL_RESOLVER_SET = {}
+for _, ip in ipairs(CONFIG.EXFIL_RESOLVERS) do
+    EXFIL_RESOLVER_SET[ip] = true
+end
 
 local drops        = 0
 local alerts       = 0
@@ -27,6 +76,21 @@ local total        = 0
 local function matches(s, pattern)
     if not s or s == "" then return false end
     return s:find(pattern) ~= nil
+end
+
+-- FIX: returns true if `dst` is in the EXFIL_RESOLVERS list.
+local function is_exfil_resolver(dst)
+    return dst and EXFIL_RESOLVER_SET[dst] == true
+end
+
+-- FIX: returns true if `name` matches any of the configured
+-- EXFIL_DOMAIN_PATTERNS.
+local function matches_exfil_domain(name)
+    if not name then return false end
+    for _, pat in ipairs(CONFIG.EXFIL_DOMAIN_PATTERNS) do
+        if name:find(pat) then return true end
+    end
+    return false
 end
 
 -- Split a domain name on '.' and return the longest single label length.
@@ -61,7 +125,10 @@ local function classify(pkt)
     local name = pkt.dns_query_name or ""
     local dst  = pkt.dst_ip or ""
 
-    if #name >= THRESHOLD_LONG_NAME and matches(name, EXFIL_PATTERN) and dst == EXFIL_RESOLVER then
+    -- FIX: check both the resolver list AND the domain pattern list.
+    local dst_is_exfil = is_exfil_resolver(dst) or matches_exfil_domain(name)
+
+    if #name >= THRESHOLD_LONG_NAME and matches(name, EXFIL_PATTERN) and dst_is_exfil then
         return "EXFIL_PAYLOAD", true     -- drop
     end
     if #name >= THRESHOLD_LONG_NAME then
@@ -85,10 +152,19 @@ NP_REGISTER_PROCESSOR({
     name = "lua_ids_mitigate",
 
     init = function()
-        print("[LUA-IDS] mitigate.lua loaded")
-        print(string.format("[LUA-IDS] rules: long_name>=%d  exfil=%q  tunnel_label>=%d  resolver=%s",
-                            THRESHOLD_LONG_NAME, EXFIL_PATTERN, TUNNEL_LABEL_LEN,
-                            EXFIL_RESOLVER))
+        -- FIX: use np_log if available (added in this patch set) for
+        -- structured logging; fall back to print() otherwise.
+        local function log(msg)
+            if np_log then np_log("info", msg) else print(msg) end
+        end
+        log("[LUA-IDS] mitigate.lua loaded")
+        log(string.format("[LUA-IDS] rules: long_name>=%d  exfil=%q  tunnel_label>=%d  resolvers=%d",
+                          THRESHOLD_LONG_NAME, EXFIL_PATTERN, TUNNEL_LABEL_LEN,
+                          #CONFIG.EXFIL_RESOLVERS))
+        if #CONFIG.EXFIL_DOMAIN_PATTERNS > 0 then
+            log(string.format("[LUA-IDS] also flagging %d domain pattern(s)",
+                              #CONFIG.EXFIL_DOMAIN_PATTERNS))
+        end
     end,
 
     process = function(pkt)
@@ -115,3 +191,4 @@ NP_REGISTER_PROCESSOR({
               total, drops, alerts))
     end,
 })
+

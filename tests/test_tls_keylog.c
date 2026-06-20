@@ -8,6 +8,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>   /* FIX: unlink() — needed for the stale-file cleanup */
 #include <string.h>
 #include <stdint.h>
 
@@ -26,6 +27,9 @@ static int tests_passed = 0;
 
 static void write_test_keylog(const char *path)
 {
+    /* FIX: unlink any stale file first (may be owned by a different user
+     * from a previous sudo run, causing fopen "Permission denied"). */
+    unlink(path);
     FILE *fp = fopen(path, "w");
     if (!fp) { perror("fopen"); exit(1); }
     /* TLS 1.2 record. */

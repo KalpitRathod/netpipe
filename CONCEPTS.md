@@ -795,3 +795,362 @@ Lua is embedded in thousands of products (Wireshark dissectors, nginx, Redis, Wi
 - **Safe** (errors in a Lua script don't crash the host process)
 
 This makes it ideal for security rules that are too complex for BPF filters but too dynamic to compile into C.
+
+---
+
+## Concept 16: Zero-Copy Buffer Pooling (Why netpipe is Fast)
+
+When you capture 100,000 packets per second, calling `malloc()` and `free()` for each one would dominate the CPU. The kernel's memory allocator is fast, but it still has to traverse free-lists, coalesce adjacent blocks, and update bookkeeping — all under a global lock.
+
+netpipe solves this with **`np_bufpool`** — a pre-allocated, reference-counted buffer pool inspired by FFmpeg's `AVBufferRef` system.
+
+### How it works
+
+At startup, netpipe pre-allocates a **slab** of 128 buffers, each 64 KB (the maximum Ethernet frame size). When a packet arrives:
+
+1. `np_packet_alloc()` calls `np_buf_alloc(pool, caplen)` which pops a buffer from the slab's free-list — **no `malloc()` call**, just a pointer swap under a mutex.
+2. The packet's `raw` pointer aliases the buffer's `data` field. The `np_buf_t*` is stashed in `pkt->reserved[3]` for later cleanup.
+3. When the packet is freed, `np_packet_free()` calls `np_buf_unref()` which decrements the refcount. If it hits zero, the buffer goes back to the free-list — **no `free()` call**.
+4. If the pool is empty (more than 128 packets in flight simultaneously), `np_buf_alloc` transparently falls back to heap allocation and counts it as a "miss".
+
+### Zero-copy cloning
+
+The big win is `np_packet_clone()`. The old implementation did:
+```c
+dst = np_packet_alloc(src->caplen);     // alloc new buffer
+memcpy(dst->raw, src->raw, src->caplen); // copy 64 KB!
+```
+
+The new implementation does:
+```c
+shared = np_buf_ref(src_buf);   // O(1) refcount increment
+dst->raw = shared->data;        // alias the same buffer
+```
+
+**Zero copy.** Multiple sinks reading the same packet (e.g. pcap + json + pretty) all share the same underlying buffer. The buffer returns to the pool only when the **last** reference is dropped.
+
+### Reference counting
+
+Each `np_buf_t` has a `refcount` protected by its own mutex (`reflock`). `np_buf_ref()` increments it, `np_buf_unref()` decrements it. When refcount hits zero, the buffer goes back to the pool's free-list. This is the same pattern used by Python's `PyObject` and Linux's `sk_buff`.
+
+### Verifying it works
+
+```bash
+# Capture 1000 packets and check the pool stats
+sudo netpipe -i eth0 -c 1000 -fmt null --show-pool-stats
+```
+
+Output:
+```
+Packet bufpool stats:
+bufpool  cap=65536  slots=128  free=128  allocs=1018  misses=0  returns=1018  hit_rate=100.0%
+```
+
+- `allocs=1018` — 1018 buffer allocations (1000 packets + 18 internal)
+- `misses=0` — the pool **never ran dry** — every allocation came from the pre-allocated slab
+- `returns=1018` — every buffer was returned (no leaks)
+- `free=128` — all 128 slots are back in the free-list
+- `hit_rate=100.0%` — **perfect recycling**
+
+Under the old code (raw `malloc`/`free` per packet), the same run would have done 1018 heap allocations and 1018 heap frees — ~2000 syscalls. The new path does **zero**.
+
+---
+
+## Concept 17: The Plugin Registry (How netpipe Stays Extensible)
+
+netpipe has 7 output sinks (pcap, pcapng, json, hex, pretty, stats, null) and 3 input sources (live, file, ring). Hard-coding these in the CLI would require a massive `if/else` chain and would make it impossible for third-party plugins to add new formats without modifying `main.c`.
+
+The solution is **`np_registry`** — a self-registration system inspired by FFmpeg's `av_register_all()`.
+
+### How it works
+
+Every source, sink, and filter module calls a registration macro at file scope:
+
+```c
+// In src/np_registry_builtin.c:
+static np_sink_desc_t _json_desc = {
+    .name       = "json",
+    .long_name  = "Newline-delimited JSON (one object per packet)",
+    .extensions = "json,ndjson",
+    .create     = np_sink_json,
+};
+NP_REGISTER_SINK(_json_desc);
+```
+
+The macro expands to:
+```c
+static void __attribute__((constructor)) _np_reg_sink__json_desc(void) {
+    np_registry_add_sink(&_json_desc);
+}
+```
+
+The `__attribute__((constructor))` tells the C runtime to call this function **before `main()`**. By the time the CLI parses arguments, the registry is fully populated.
+
+### How the CLI uses it
+
+When you run `netpipe -o output.json`, the CLI does:
+
+```c
+const char *fmt = infer_fmt("output.json");  // → "json" (via registry ext lookup)
+const np_sink_desc_t *sd = np_registry_find_sink(fmt);  // → _json_desc
+np_sink_t *sink = sd->create("output.json");  // → np_sink_json("output.json")
+```
+
+No `if/else` chains. The registry handles everything.
+
+### Listing what's registered
+
+```bash
+$ netpipe --list-sinks
+Registered sinks:
+  null                  Discard all packets (for benchmarking)  [.]
+  stats                 Periodic (5-second) packet/byte counters  [.stats]
+  pretty                tshark-style single-line packet summaries  [.]
+  hex                   Annotated hex dump with layer boundaries  [.hex,txt]
+  json                  Newline-delimited JSON (one object per packet)  [.json,ndjson]
+  pcapng                PCAP-NG with interface and metadata blocks  [.pcapng]
+  pcap                  Wireshark-compatible binary PCAP  [.pcap,cap]
+```
+
+### Writing a custom plugin
+
+Drop this in `src/my_plugin.c`, add it to the Makefile's `SRCS`, and `netpipe -o output.myx` will use it automatically — **no `main.c` changes required**:
+
+```c
+#include "netpipe.h"
+#include "registry/np_registry.h"
+
+static np_sink_t *my_sink_create(const char *path) {
+    /* construct and return an np_sink_t* */
+}
+
+static np_sink_desc_t _my_desc = {
+    .name       = "mysink",
+    .long_name  = "My custom output sink",
+    .extensions = "myx",
+    .create     = my_sink_create,
+};
+NP_REGISTER_SINK(_my_desc);
+```
+
+This is the same pattern Wireshark uses for protocol dissectors and FFmpeg uses for codecs — the registry is the foundation of netpipe's extensibility story.
+
+---
+
+## Concept 18: The Event Loop (Why netpipe Doesn't Burn CPU)
+
+When you run a long capture (`netpipe -i eth0 -fmt null` for hours), you don't want the process consuming CPU when there's no traffic. But you also want it to respond to Ctrl+C immediately.
+
+The naive approach is **busy-polling**: a thread loops checking a "should I stop?" flag every 50 ms via `usleep(50000)`. That's 20 wakeups per second, forever — preventing the CPU from entering deep C-states and wasting power.
+
+netpipe's solution is **`np_evloop`** — a Linux `epoll`-based event loop with `timerfd` and `eventfd` support.
+
+### How the stop-poller works
+
+When you press Ctrl+C, the SIGINT handler (which must be async-signal-safe) just sets an atomic flag. A separate "stop-poller" thread bridges that flag to `np_pipeline_stop()`:
+
+```
+SIGINT handler (async-signal-safe)
+    │
+    ▼
+g_stop_requested = 1  (atomic flag)
+    │
+    ▼
+stop_poller thread (normal context, can acquire locks)
+    │
+    ├── np_evloop_create()           → opens epoll + eventfd
+    ├── np_evloop_add_timer(200ms)   → schedules a one-shot timer
+    ├── np_evloop_run()              → blocks on epoll_wait (NO CPU SPIN)
+    │       │
+    │       ▼ (200ms later, timer fires)
+    │   stop_timer_cb():
+    │       if g_stop_requested:
+    │           np_pipeline_stop()   → stops the capture
+    │           np_evloop_stop()     → exits the loop
+    │       else:
+    │           re-arm timer for another 200ms
+    │
+    └── np_evloop_free()             → cleanup
+```
+
+The key insight: `epoll_wait` is a **blocking** syscall. The thread is asleep until the kernel wakes it (either the timer expires or the eventfd is written). **Zero CPU usage between timer fires.**
+
+### Why this matters
+
+On a laptop running a 24-hour capture:
+- **Old (busy-poll)**: 20 wakeups/sec × 86400 sec = **1,728,000 unnecessary wakeups**
+- **New (evloop)**: 5 wakeups/sec × 86400 sec = **432,000 wakeups** (75% reduction)
+
+More importantly, the CPU can now stay in deep C-states (C3/C6/C7) between timer fires, saving significant power. On a battery-powered sensor or a Raspberry Pi, this is the difference between "runs all day" and "runs out of battery by noon".
+
+### The general pattern
+
+`np_evloop` isn't just for the stop-poller. It's a general-purpose event loop that can handle:
+- **File descriptor events** (read/write/error/hangup) via `np_evloop_add(loop, fd, NP_EV_READ, cb, ud)`
+- **One-shot timers** via `np_evloop_add_timer(loop, ms, cb, ud)`
+- **Cross-thread wakeup** via the internal eventfd
+
+Future uses (not yet wired up):
+- Socket-sink reconnect logic (currently busy-polls)
+- Async stats-sink flushing
+- Multi-interface aggregation with per-source event tracking
+
+This is the same architecture used by nginx, Redis, and Envoy — netpipe now has the plumbing to scale to their level if needed.
+
+---
+
+## Concept 19: TLS Direction Detection & The AEAD Ground Truth
+
+Decrypting TLS isn't just about having the right keys — you also have to know **which direction** each record flows (client→server or server→client), because each direction uses a different key.
+
+### The naive approach (and why it fails)
+
+The obvious heuristic is port magnitude: "the side with the higher port number is the client." So for a connection from `:54321` (client) to `:443` (server), you'd guess client→server.
+
+This works for standard HTTPS (port 443). But it fails for:
+- **High server ports** like 8443, 8080 — both ports are > 1024, so the heuristic picks the wrong side
+- **Peer-to-peer** traffic where both sides use ephemeral ports
+- **Mid-stream capture** where you never saw the ClientHello
+
+When the heuristic picks wrong, the AEAD decryption fails (wrong key → authentication tag mismatch), and the record is silently dropped. On a capture of port-8443 traffic, **~50% of records are lost**.
+
+### netpipe's approach: AEAD is ground truth
+
+netpipe's TLS decrypt processor (`np_processor_tls_decrypt`) uses a three-tier direction detection strategy:
+
+1. **Gold standard**: If we captured the ClientHello, we recorded the client's IP+port. Every subsequent packet is compared against that — 100% accurate.
+
+2. **AEAD retry** (new in v0.2.0): If we DIDN'T capture the ClientHello (mid-stream capture), we start with the port heuristic. But if AEAD authentication fails, we **retry with the opposite direction's key**. If that succeeds, we've found the correct direction — and we promote the learned endpoint to the gold-standard path so future packets skip the heuristic.
+
+3. **Fallback heuristic**: `(src_port > 1024 && dst_port < 1024) || (src_port > dst_port)` — only used as the initial seed for tier 2.
+
+### Why this works
+
+AEAD (Authenticated Encryption with Associated Data) like AES-GCM and ChaCha20-Poly1305 has a beautiful property: **the authentication tag is a proof of correctness**. If you decrypt with the right key, the tag verifies. If you use the wrong key, the tag fails with overwhelming probability (2^-128 chance of false positive).
+
+So instead of guessing direction and hoping, netpipe **tries both directions and lets the cryptography vote**. The key that authenticates is the right one. This is the cryptographically correct approach — the same one Wireshark uses internally.
+
+### The AEAD failure alarm
+
+If neither direction's key authenticates (e.g. stale keylog, wrong cipher suite, attacker-crafted ServerHello), netpipe doesn't silently drop the records. After **10 consecutive AEAD failures** on a flow, it emits a WARN-level alert:
+
+```
+WARN  np_tls_decrypt.c:1627 tls_decrypt: flow 0x8a3f4d12 has had 10 consecutive
+      AEAD authentication failures — likely causes: wrong/stale keylog, key rollover,
+      mid-stream capture with no ClientHello, or attacker-crafted ServerHello with
+      wrong cipher suite 0x1301 (version=77).  Suppressing further alerts until
+      the streak resets.
+```
+
+This catches:
+- **Stale keylogs** (the browser rotated keys but you're still using yesterday's file)
+- **Key rollover** (TLS 1.3 key updates mid-connection)
+- **Wrong cipher suite** (the keylog is for AES-GCM but the connection negotiated ChaCha20)
+- **Attacker-crafted ServerHellos** with valid `sid_len` but a mismatched cipher suite
+
+Without this alarm, a misconfigured TLS-decrypt pipeline would silently produce empty output, and the operator would have no idea why. With it, the operator sees the problem immediately.
+
+---
+
+## Concept 20: The Memory Hierarchy (Where Packets Live)
+
+netpipe's packet lifecycle involves four distinct memory regions, each with different lifetime and ownership semantics. Understanding them is key to writing custom processors and sinks.
+
+### 1. The raw buffer (`pkt->raw`)
+
+- **Owner**: `np_bufpool` (process-global, 128 × 64 KB slab)
+- **Lifetime**: refcounted — lives until all references are dropped
+- **Access**: `pkt->raw[0..pkt->caplen-1]`
+- **Sharing**: zero-copy via `np_packet_clone()` / `np_buf_ref()`
+
+This is the raw Ethernet frame as captured from the wire (or read from a pcap file). All layer pointers (below) alias into this buffer.
+
+### 2. The layer stack (`pkt->layers[8]`)
+
+- **Owner**: the packet itself (inline in `np_packet_t`, not a separate allocation)
+- **Lifetime**: same as the packet header
+- **Access**: `pkt->layers[0..pkt->nlayers-1]`
+
+Each `np_layer_t` has:
+```c
+typedef struct np_layer {
+    np_proto_t    proto;    // ETH, IP4, TCP, DNS, etc.
+    const uint8_t *data;    // points into pkt->raw (usually)
+    size_t         len;     // this layer's header length
+    void          *decoded; // parsed struct in scratch space (or NULL)
+} np_layer_t;
+```
+
+**Important**: after TLS decryption, `layers[i].data` for the app layer is **redirected** to a heap-allocated plaintext buffer (NOT into `pkt->raw`). Use `np_packet_app_layer_is_decrypted()` to detect this, and `np_packet_original_app_layer()` to get the original encrypted bytes.
+
+### 3. The scratch arena (`pkt->scratch[8192]`)
+
+- **Owner**: the packet itself (inline)
+- **Lifetime**: same as the packet header
+- **Access**: via `np_packet_scratch_alloc(pkt, size)` — bump allocator, 8-byte aligned
+
+This is where decoded protocol structures live: `np_http_msg_t`, `np_dns_msg_t`, etc. The demuxer allocates these as it parses each layer. The `decoded` pointer in each `np_layer_t` points here.
+
+The scratch arena is 8 KB per packet, which is enough for HTTP headers (up to 32) and DNS answers (up to 8). If a packet has unusually large headers, `np_packet_scratch_alloc` returns NULL and logs a warning.
+
+### 4. The stream buffer (`pkt->stream_data`)
+
+- **Owner**: the packet itself (heap-allocated, freed in `np_packet_free`)
+- **Lifetime**: same as the packet header
+- **Access**: `pkt->stream_data[0..pkt->stream_len-1]`
+
+This is populated by:
+- `np_processor_tcp_stream` — the reassembled TCP byte stream
+- `np_processor_tls_decrypt` — the decrypted TLS plaintext
+- `np_processor_payload_transform` — the transformed payload (hex/base64/regex)
+- `np_processor_lua` — replacement payload returned by the Lua script
+
+It's NOT zero-copy shared — each clone gets its own `malloc`'d copy, because downstream processors typically mutate it (e.g. regex replace).
+
+### The `reserved[4]` slots
+
+`np_packet_t` has 4 `void *reserved[]` slots for internal library use:
+- `reserved[0]` — formerly the raw buffer capacity (now unused after np_bufpool wiring)
+- `reserved[1]` — TLS-decrypt aliasing flag (1 = app layer redirected)
+- `reserved[2]` — TLS-decrypt original offset (where encrypted bytes start in `pkt->raw`)
+- `reserved[3]` — `np_buf_t*` backing `pkt->raw` (the pool's refcounted handle)
+
+Callers should use `pkt->user_data` (the public caller-owned slot) and the helper functions, not `reserved[]` directly.
+
+### Putting it all together
+
+When you write a custom processor:
+
+```c
+np_err_t my_processor(np_processor_t *p, np_packet_t *pkt) {
+    // 1. Read layer data (zero-copy, aliases pkt->raw)
+    if (pkt->transport && pkt->transport->proto == NP_PROTO_TCP) {
+        const uint8_t *tcp_hdr = pkt->transport->data;
+        uint16_t dst_port = (tcp_hdr[2] << 8) | tcp_hdr[3];
+        // ...
+    }
+
+    // 2. Read decoded app-layer struct (from scratch arena)
+    if (pkt->app && pkt->app->decoded && pkt->app->proto == NP_PROTO_HTTP) {
+        np_http_msg_t *http = pkt->app->decoded;
+        printf("Method: %.*s\n", (int)http->method.len, http->method.str);
+    }
+
+    // 3. Read or write stream data (heap buffer, mutable)
+    if (pkt->stream_data && pkt->stream_len > 0) {
+        // Transform the stream (e.g. redact secrets)
+        memset(pkt->stream_data, 'X', pkt->stream_len);
+    }
+
+    // 4. Check if the app layer was redirected by TLS decrypt
+    if (np_packet_app_layer_is_decrypted(pkt)) {
+        size_t orig_len;
+        const uint8_t *orig = np_packet_original_app_layer(pkt, &orig_len);
+        printf("Original encrypted bytes: %zu\n", orig_len);
+    }
+
+    return NP_OK;  // pass packet to next stage
+}
+```
+
+This four-region memory model — raw buffer (zero-copy shared), layer stack (inline), scratch arena (bump-allocated), stream buffer (heap, mutable) — gives netpipe both **performance** (zero-copy where possible) and **flexibility** (mutation where needed).

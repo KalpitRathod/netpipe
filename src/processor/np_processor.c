@@ -100,13 +100,24 @@ static np_err_t rate_process(np_processor_t *proc, np_packet_t *pkt)
             /* Bug 3.2 + 3.3: use nanosleep instead of usleep to avoid
              * useconds_t overflow on large waits (> 4.29 s) and to
              * get higher-resolution sleeps (usleep has ~1ms granularity
-             * on non-realtime Linux, causing rate drift under low caps). */
+             * on non-realtime Linux, causing rate drift under low caps).
+             *
+             * Bug B22 fix: enforce a minimum sleep of 100µs.  The old
+             * code fell back to 1µs when wait_s rounded to 0, which on
+             * a non-realtime kernel actually sleeps ~1ms anyway — but
+             * the loop iteration overhead (clock_gettime, bucket math)
+             * dominated, causing high CPU spin when the rate cap was
+             * far above the packet arrival rate.  100µs is a sensible
+             * floor: short enough to keep throughput tight, long enough
+             * to amortise the syscall + math overhead. */
             double needed = (double)pkt->wirelen - p->bucket;
             double wait_s = needed / (double)p->bytes_per_sec;
             struct timespec ts;
             ts.tv_sec  = (time_t)wait_s;
             ts.tv_nsec = (long)((wait_s - (double)ts.tv_sec) * 1e9);
-            if (ts.tv_sec == 0 && ts.tv_nsec == 0) ts.tv_nsec = 1000;  /* min 1µs */
+            if (ts.tv_sec == 0 && ts.tv_nsec < 100000L) {
+                ts.tv_nsec = 100000L;  /* min 100µs to avoid busy-spin */
+            }
             nanosleep(&ts, NULL);
         }
     }
@@ -173,6 +184,16 @@ static void get_packet_payload(const np_packet_t *pkt, const uint8_t **out_data,
 
 static void hex_encode(const uint8_t *in, size_t in_len, uint8_t **out, size_t *out_len)
 {
+    /* Bug B21 fix: check for size_t overflow before computing in_len * 2.
+     * On 32-bit platforms, if in_len > SIZE_MAX/2 the multiplication
+     * wraps around to a small value and we'd malloc a tiny buffer then
+     * write past its end.  In practice in_len is bounded by pkt->caplen
+     * (uint32_t) so this is unreachable on 64-bit, but defensive. */
+    if (in_len > (SIZE_MAX - 1) / 2) {
+        NP_LOG_ERROR("hex_encode: in_len %zu too large (would overflow)", in_len);
+        *out = NULL; *out_len = 0;
+        return;
+    }
     size_t len = in_len * 2;
     uint8_t *res = malloc(len + 1);
     if (!res) { *out = NULL; *out_len = 0; return; }
@@ -188,7 +209,23 @@ static const char b64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstu
 
 static void base64_encode(const uint8_t *in, size_t in_len, uint8_t **out, size_t *out_len)
 {
-    size_t len = 4 * ((in_len + 2) / 3);
+    /* Bug B21 fix: check for size_t overflow in the base64 length
+     * computation.  The formula 4 * ((in_len + 2) / 3) can overflow
+     * in two places: (in_len + 2) overflows if in_len > SIZE_MAX - 2,
+     * and 4 * ... overflows if the division result > SIZE_MAX / 4.
+     * Reject up-front if either bound is breached. */
+    if (in_len > SIZE_MAX - 2) {
+        NP_LOG_ERROR("base64_encode: in_len %zu too large (would overflow)", in_len);
+        *out = NULL; *out_len = 0;
+        return;
+    }
+    size_t triples = (in_len + 2) / 3;
+    if (triples > SIZE_MAX / 4) {
+        NP_LOG_ERROR("base64_encode: in_len %zu too large (would overflow)", in_len);
+        *out = NULL; *out_len = 0;
+        return;
+    }
+    size_t len = 4 * triples;
     uint8_t *res = malloc(len + 1);
     if (!res) { *out = NULL; *out_len = 0; return; }
 
@@ -245,9 +282,25 @@ static void regex_replace_payload(const uint8_t *in, size_t in_len,
     size_t res_len = 0;
 
     char *cursor = src;
-    regmatch_t pmatch[10];
+    /* Bug B23 fix: size pmatch from the compiled regex's re_nsub field
+     * rather than a fixed array of 10.  POSIX requires nmatch >=
+     * re.re_nsub + 1; the old code passed 10 unconditionally, which
+     * silently truncated regexes with more than 9 capture groups
+     * (regexec would either return REG_NOMATCH or fill only the first
+     * 10 slots, losing the others). */
+    size_t nmatch = (size_t)re.re_nsub + 1;
+    regmatch_t *pmatch = malloc(nmatch * sizeof(*pmatch));
+    if (!pmatch) {
+        NP_LOG_ERROR("regex_replace: out of memory for %zu match slots", nmatch);
+        regfree(&re);
+        free(src);
+        free(res);
+        *out = NULL;
+        *out_len = 0;
+        return;
+    }
 
-    while (regexec(&re, cursor, 10, pmatch, 0) == 0) {
+    while (regexec(&re, cursor, nmatch, pmatch, 0) == 0) {
         size_t before_len = (size_t)pmatch[0].rm_so;
         if (res_len + before_len >= res_cap) {
             res_cap = res_len + before_len + 256;
@@ -258,12 +311,19 @@ static void regex_replace_payload(const uint8_t *in, size_t in_len,
         memcpy(res + res_len, cursor, before_len);
         res_len += before_len;
 
-        /* Copy replacement and support group backreferences \0 to \9 */
+        /* Copy replacement and support group backreferences \0 to \9.
+         * Bug B23 note: backreferences beyond \9 are not supported by
+         * this single-digit syntax — that would require multi-digit
+         * parsing (e.g. ${10}).  But at least the matching itself now
+         * succeeds for regexes with > 9 capture groups (the pmatch
+         * array is sized to re.re_nsub + 1).  Backreferences to groups
+         * 10+ in the replacement string are simply ignored. */
         const char *rep_ptr = replacement;
         while (*rep_ptr) {
             if (*rep_ptr == '\\' && *(rep_ptr + 1) >= '0' && *(rep_ptr + 1) <= '9') {
-                int group = *(rep_ptr + 1) - '0';
-                if (pmatch[group].rm_so != -1 && pmatch[group].rm_eo != -1) {
+                size_t group = (size_t)(*(rep_ptr + 1) - '0');
+                if (group < nmatch &&
+                    pmatch[group].rm_so != -1 && pmatch[group].rm_eo != -1) {
                     size_t group_len = (size_t)(pmatch[group].rm_eo - pmatch[group].rm_so);
                     if (res_len + group_len >= res_cap) {
                         res_cap = res_len + group_len + 256;
@@ -314,6 +374,7 @@ static void regex_replace_payload(const uint8_t *in, size_t in_len,
 
     regfree(&re);
     free(src);
+    free(pmatch);
     *out = (uint8_t *)res;
     *out_len = res_len;
     return;
@@ -322,6 +383,7 @@ fail:
     regfree(&re);
     free(src);
     free(res);
+    free(pmatch);
     *out = NULL;
     *out_len = 0;
 }
